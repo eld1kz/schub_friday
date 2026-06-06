@@ -3,9 +3,12 @@ os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
 import asyncio
 import base64
+import subprocess
+import sys
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+from pathlib import Path
 from dotenv import load_dotenv
 import anthropic
 from google.oauth2.credentials import Credentials
@@ -24,6 +27,33 @@ supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 conversation_history: dict[str, deque] = {}
 # Email drafts awaiting the user's yes/no confirmation before send_email sends.
 pending_emails: dict[str, dict] = {}
+
+# Only these Telegram user ids may use the bot. Falls back to TELEGRAM_CHAT_ID so
+# it works with the existing config; empty set = locked (deny everyone).
+ALLOWED_USER_IDS = {
+    uid.strip()
+    for uid in (os.environ.get("TELEGRAM_ALLOWED_IDS")
+                or os.environ.get("TELEGRAM_CHAT_ID", "")).split(",")
+    if uid.strip()
+}
+
+
+def _is_authorized(user_id: str) -> bool:
+    return user_id in ALLOWED_USER_IDS
+
+
+KST = timezone(timedelta(hours=9))
+
+
+def _normalize_remind_at(value: str) -> str:
+    """Treat a tz-naive remind_at (KST wall-clock) as KST, return a UTC ISO string."""
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=KST)
+    return dt.astimezone(timezone.utc).isoformat()
 
 REDIRECT_URI = "http://localhost:8080/oauth/callback"
 CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar"]
@@ -46,7 +76,8 @@ BASE_SYSTEM_PROMPT = (
     "You are a concise, friendly personal assistant. "
     "Keep replies short and direct. No unnecessary filler. "
     "You have tools to check the time, save reminders, search the web, "
-    "manage the user's Google Calendar, and read and send Gmail. "
+    "manage the user's Google Calendar, read and send Gmail, and check the "
+    "user's university grades and assignments. "
     "When the user asks to send an email, call send_email to prepare a draft. "
     "It does NOT send immediately — show the user the drafted email and tell "
     "them to reply 'yes' to send or 'no' to cancel."
@@ -142,6 +173,20 @@ TOOLS = [
             },
             "required": ["to", "subject", "body"],
         },
+    },
+    {
+        "name": "check_grades",
+        "description": "Checks the user's Korea University (LMS) grades and assignments "
+                       "via the Canvas API: per-course current/final score plus each "
+                       "assignment's score, submission status, and due date.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "check_assignments",
+        "description": "Lists the user's university assignments via the Canvas API: which are "
+                       "not submitted (with due dates, flagging overdue) and which are "
+                       "submitted awaiting a grade. Use for 'what's due' / 'what do I owe'.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
     },
 ]
 
@@ -361,6 +406,39 @@ def _classify_confirmation(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# University grades (Canvas API, run as a subprocess)
+# ---------------------------------------------------------------------------
+
+GRADES_SCRIPT = Path(__file__).with_name("uni_api_grades.py")
+
+
+def _run_uni_script(*args: str) -> str:
+    """Run the Canvas API reader in a subprocess and return its stdout report."""
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(GRADES_SCRIPT), *args],
+            capture_output=True, text=True, timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        return "University check timed out. Try again in a moment."
+    if proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout).strip()
+        if "uni_login_test" in msg or "Session expired" in msg or "401" in msg:
+            return ("University session expired. On the computer running the bot, run "
+                    "`python uni_login_test.py` to log in again, then ask me to re-check.")
+        return f"Could not read university data: {msg[:300]}"
+    return proc.stdout.strip() or "No data found."
+
+
+def check_university_grades() -> str:
+    return _run_uni_script()
+
+
+def check_university_assignments() -> str:
+    return _run_uni_script("--assignments")
+
+
+# ---------------------------------------------------------------------------
 # Tool execution
 # ---------------------------------------------------------------------------
 
@@ -373,9 +451,9 @@ def run_tool(name: str, tool_input: dict, user_id: str) -> str:
             supabase.table("reminders").insert({
                 "user_id": user_id,
                 "text": tool_input["text"],
-                "remind_at": tool_input["remind_at"],
+                "remind_at": _normalize_remind_at(tool_input["remind_at"]),
             }).execute()
-            return f"Saved: '{tool_input['text']}' at {tool_input['remind_at']}"
+            return f"Saved: '{tool_input['text']}' for {tool_input['remind_at']}"
         except Exception as e:
             return f"Failed to save reminder: {e}"
 
@@ -392,6 +470,12 @@ def run_tool(name: str, tool_input: dict, user_id: str) -> str:
 
     if name == "read_email":
         return read_email(user_id, tool_input["id"])
+
+    if name == "check_grades":
+        return check_university_grades()
+
+    if name == "check_assignments":
+        return check_university_assignments()
 
     if name == "send_email":
         # Do NOT send here. Stash the draft; the user confirms in their next message.
@@ -547,6 +631,8 @@ TOOL_STATUS = {
     "list_recent_emails": "✉️ Checking your inbox...",
     "read_email": "✉️ Reading the email...",
     "send_email": "📤 Preparing the draft...",
+    "check_grades": "🎓 Checking your grades...",
+    "check_assignments": "📝 Checking your assignments...",
 }
 
 
@@ -646,6 +732,9 @@ async def handle_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                             fresh refresh_token even if the user connected before.
     """
     user_id = str(update.effective_user.id)
+    if not _is_authorized(user_id):
+        await update.message.reply_text("Sorry, this is a private bot.")
+        return
     flow = Flow.from_client_config(
         GOOGLE_CLIENT_CONFIG, scopes=SCOPES, redirect_uri=REDIRECT_URI,
         autogenerate_code_verifier=False,   # disable PKCE: we have a client_secret, and the
@@ -664,6 +753,10 @@ async def handle_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
+    if not _is_authorized(user_id):
+        print(f"[auth] blocked message from user {user_id}")
+        await update.message.reply_text("Sorry, this is a private bot.")
+        return
     user_text = update.message.text
 
     # Confirm-before-send: if a draft is pending, this message is the yes/no decision.
@@ -723,6 +816,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 def main() -> None:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
+    if not ALLOWED_USER_IDS:
+        print("[auth] WARNING: no TELEGRAM_ALLOWED_IDS / TELEGRAM_CHAT_ID set — "
+              "bot will deny everyone. Set your Telegram id to use it.")
+    else:
+        print(f"[auth] bot restricted to user id(s): {', '.join(sorted(ALLOWED_USER_IDS))}")
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("connect", handle_connect))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
