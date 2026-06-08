@@ -1,0 +1,24 @@
+fast_food:
+  policy_kind: review_if_repeated
+  passive_suggestion_threshold: 3
+  window_days: 7
+  cooldown_days: 14
+  message_template: "You have visited fast-food restaurants {count} times this week. Would you like me to keep an eye on this habit?"
+coffee_shop:
+  policy_kind: user_goal_only
+restaurant:
+  policy_kind: neutral
+grocery_store:
+  policy_kind: neutral
+convenience_store:
+  policy_kind: neutral
+gym:
+  policy_kind: user_goal_only
+pharmacy:
+  policy_kind: neutral
+university:
+  policy_kind: neutral
+bar:
+  policy_kind: user_goal_only
+other:
+  policy_kind: neutral

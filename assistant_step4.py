@@ -4,6 +4,7 @@ os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 import asyncio
 import base64
 import json
+import re
 import ssl
 import subprocess
 import sys
@@ -17,6 +18,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import anthropic
 import certifi
+import dateparser
 try:
     from croniter import croniter
 except ImportError:                       # schedule automations are skipped if missing
@@ -31,17 +33,45 @@ from telegram.ext import (
     ApplicationBuilder, CallbackQueryHandler, CommandHandler, MessageHandler,
     filters, ContextTypes,
 )
+from habit_llm_service import HabitLLMService
+from habit_policy_service import HabitPolicyService
+from habit_repository import SupabaseHabitRepository, iso, utcnow
+from location_service import LocationService
+from nudge_service import NudgeService
+from places_provider import CachedPlacesProvider, GooglePlacesProvider
+from retention_cleanup import cleanup_location_retention
+from visit_detection_service import VisitDetectionService
+from watcher_service import WatcherService
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
 claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+habit_repo = SupabaseHabitRepository(supabase)
+habit_nudges = NudgeService(habit_repo, lambda uid, text, buttons=None: _send_telegram(uid, text, buttons))
+habit_watchers = WatcherService(habit_repo, habit_nudges)
+habit_policies = HabitPolicyService(habit_repo, habit_nudges)
+habit_llm = HabitLLMService(habit_repo, claude_client=claude)
+habit_location = LocationService(
+    VisitDetectionService(
+        habit_repo,
+        CachedPlacesProvider(GooglePlacesProvider()),
+        llm_service=habit_llm,
+    ),
+    habit_watchers,
+    habit_policies,
+)
 
 conversation_history: dict[str, deque] = {}
 # Email drafts awaiting the user's yes/no confirmation before send_email sends.
 pending_emails: dict[str, dict] = {}
 # Action-tier automation runs awaiting an inline-keyboard confirm (id -> action).
 pending_actions: dict[str, dict] = {}
+# Calendar fast-path ops awaiting a Yes/No tap before the Google API is called.
+pending_calendar: dict[str, dict] = {}
+# Habit watcher drafts and destructive-data confirmations.
+pending_habit_watchers: dict[str, dict] = {}
+pending_forget: dict[str, str] = {}
 
 # Only these Telegram user ids may use the bot. Falls back to TELEGRAM_CHAT_ID so
 # it works with the existing config; empty set = locked (deny everyone).
@@ -102,7 +132,9 @@ BASE_SYSTEM_PROMPT = (
     "rule text verbatim and relay the confirmation. Use list_automations, "
     "set_automation, and delete_automation to manage them. You also proactively "
     "suggest automations; if the user asks to stop or resume those suggestions, "
-    "call set_suggestions."
+    "call set_suggestions. For habit/location tracking, only create watcher rules "
+    "when the user explicitly asks. Use neutral language; never diagnose health or "
+    "claim one visit proves a problem."
 )
 
 
@@ -265,6 +297,54 @@ TOOLS = [
                 "enabled": {"type": "boolean", "description": "true to allow suggestions, false to stop them"},
             },
             "required": ["enabled"],
+        },
+    },
+    {
+        "name": "create_habit_watcher",
+        "description": "Creates an explicitly requested habit/location watcher after validating arguments.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "rule_type": {"type": "string"},
+                "target_category": {"type": "string"},
+                "target_brand": {"type": "string"},
+                "threshold_count": {"type": "integer"},
+                "window_days": {"type": "integer"},
+                "reminder_text": {"type": "string"},
+            },
+            "required": ["rule_type"],
+        },
+    },
+    {
+        "name": "list_habit_watchers",
+        "description": "Lists the user's active habit/location watcher rules.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "delete_habit_watcher",
+        "description": "Deletes one habit watcher by id.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"watcher_id": {"type": "string"}},
+            "required": ["watcher_id"],
+        },
+    },
+    {
+        "name": "set_habit_suggestions_enabled",
+        "description": "Turns passive habit suggestions on or off.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"enabled": {"type": "boolean"}},
+            "required": ["enabled"],
+        },
+    },
+    {
+        "name": "get_recent_place_visits",
+        "description": "Returns recent confirmed place visits, without raw GPS coordinates.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer"}},
+            "required": [],
         },
     },
 ]
@@ -574,6 +654,56 @@ def run_tool(name: str, tool_input: dict, user_id: str) -> str:
     if name == "set_suggestions":
         return set_suggestions(user_id, tool_input["enabled"])
 
+    if name == "create_habit_watcher":
+        try:
+            row = habit_watchers.create_habit_watcher(
+                user_id=user_id,
+                rule_type=tool_input["rule_type"],
+                target_category=tool_input.get("target_category"),
+                target_brand=tool_input.get("target_brand"),
+                threshold_count=tool_input.get("threshold_count"),
+                window_days=tool_input.get("window_days"),
+                reminder_text=tool_input.get("reminder_text"),
+            )
+            target = row.get("target_brand") or row.get("target_category") or "that pattern"
+            if row["rule_type"] == "weekly_visit_limit":
+                return (
+                    f"Got it. I'll let you know when you exceed "
+                    f"{row.get('threshold_count')} {str(target).replace('_', ' ')} visits during a calendar week."
+                )
+            if row["rule_type"].startswith("near_"):
+                return f"Got it. I'll remind you when you are near {str(target).replace('_', ' ')}."
+            return f"Saved habit watcher {str(row.get('id', ''))[:8]}."
+        except Exception as e:
+            return f"Could not create that watcher: {e}"
+
+    if name == "list_habit_watchers":
+        rows = habit_watchers.list_habit_watchers(user_id)
+        if not rows:
+            return "No active habit watchers."
+        return "\n".join(
+            f"[{str(r['id'])[:8]}] {r['rule_type']} — "
+            f"{r.get('target_brand') or r.get('target_category') or r.get('target_place_id') or 'target'}"
+            for r in rows
+        )
+
+    if name == "delete_habit_watcher":
+        ok = habit_watchers.delete_habit_watcher(user_id, tool_input["watcher_id"])
+        return "Deleted watcher." if ok else "No watcher matched that id."
+
+    if name == "set_habit_suggestions_enabled":
+        habit_repo.update_settings(user_id, habit_suggestions_enabled=tool_input["enabled"])
+        return "Passive habit suggestions are on." if tool_input["enabled"] else "Passive habit suggestions are off."
+
+    if name == "get_recent_place_visits":
+        rows = habit_repo.list_visits(user_id, min(int(tool_input.get("limit", 20)), 20))
+        if not rows:
+            return "No confirmed visits yet."
+        return "\n".join(
+            f"{r['place_name']} — {r['normalized_category']} — {r['confirmed_at']}"
+            for r in rows
+        )
+
     if name == "send_email":
         # Do NOT send here. Stash the draft; the user confirms in their next message.
         pending_emails[user_id] = {
@@ -815,6 +945,285 @@ class StatusReporter:
 
 
 # ---------------------------------------------------------------------------
+# Calendar fast-path — cheap, reliable add/edit/delete that skips the tool loop
+#
+# Why: routing "add dinner tomorrow 7pm" through the full loop spends a big
+# system prompt (full tool catalog + memory + history) AND makes the model do
+# date math, which it gets wrong. The fast-path instead: a free regex gate, then
+# ONE tiny Haiku call that only extracts wording (no date math), then dateparser
+# resolves the time exactly against KST, then a TEMPLATED Yes/No confirm before
+# the Google API is ever called. Anything it can't cleanly handle returns False
+# and falls through to the unchanged full tool loop.
+# ---------------------------------------------------------------------------
+
+# Free pre-filter: a calendar verb near a time word, or an explicit calendar noun.
+_CAL_VERB = (r"add|schedule|create|set ?up|book|move|reschedul\w*|shift|push|"
+             r"change|cancel|delete|remove|put")
+_CAL_TIME = (r"tomorrow|tonight|today|next |this |on \w+day|\bat \d|\d\s?(am|pm)\b|"
+             r"\d:\d\d|\bmon|tue|wed|thu|fri|sat|sun|"
+             r"jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec")
+_CAL_NOUN = r"\b(calendar|meeting|appointment)\b"
+_CAL_VERB_RE = re.compile(rf"\b({_CAL_VERB})\b", re.I)
+_CAL_TIME_RE = re.compile(_CAL_TIME, re.I)
+_CAL_NOUN_RE = re.compile(_CAL_NOUN, re.I)
+
+
+def _cal_gate(text: str) -> bool:
+    return bool(_CAL_NOUN_RE.search(text)
+                or (_CAL_VERB_RE.search(text) and _CAL_TIME_RE.search(text)))
+
+
+_CAL_EXTRACT_SYSTEM = (
+    "Extract ONE calendar operation from the user's message as strict JSON with keys: "
+    "action ('add'|'edit'|'delete'|'none'), title, time_phrase, end_phrase, "
+    "duration_minutes, recurrence, event_reference.\n"
+    "Rules:\n"
+    "- Return action 'none' if it is NOT a simple calendar add/edit/delete (a reminder, "
+    "a question, listing events, or anything complex/ambiguous).\n"
+    "- Copy the user's date/time wording VERBATIM into time_phrase/end_phrase. Do NOT "
+    "compute, resolve, or reformat dates.\n"
+    "- For edit/delete, put the words identifying which event into event_reference.\n"
+    "- recurrence: a short word like 'daily'/'weekly'/'every monday', else null.\n"
+    "- Use null for any missing field. Output ONLY the JSON object."
+)
+
+
+def _extract_calendar(text: str) -> dict | None:
+    """One minimal Haiku call: message -> structured calendar op (no date math)."""
+    try:
+        resp = claude.messages.create(
+            model="claude-haiku-4-5", max_tokens=200,
+            system=_CAL_EXTRACT_SYSTEM,
+            messages=[{"role": "user", "content": text}],
+        )
+        raw = "".join(b.text for b in resp.content if hasattr(b, "text")).strip()
+        if "{" in raw and "}" in raw:
+            raw = raw[raw.find("{"): raw.rfind("}") + 1]
+        return json.loads(raw)
+    except Exception as e:
+        print(f"[cal] extract failed: {e}")
+        return None
+
+
+def _to_rrule(recurrence) -> str | None:
+    if not recurrence:
+        return None
+    r = str(recurrence).lower()
+    if r.startswith("rrule"):
+        return recurrence
+    table = {
+        "weekday": "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+        "daily": "RRULE:FREQ=DAILY", "every day": "RRULE:FREQ=DAILY",
+        "weekly": "RRULE:FREQ=WEEKLY", "every week": "RRULE:FREQ=WEEKLY",
+        "monthly": "RRULE:FREQ=MONTHLY", "every month": "RRULE:FREQ=MONTHLY",
+        "yearly": "RRULE:FREQ=YEARLY",
+    }
+    for k, v in table.items():
+        if k in r:
+            return v
+    days = {"monday": "MO", "tuesday": "TU", "wednesday": "WE", "thursday": "TH",
+            "friday": "FR", "saturday": "SA", "sunday": "SU"}
+    for d, code in days.items():
+        if d in r:
+            return f"RRULE:FREQ=WEEKLY;BYDAY={code}"
+    return None
+
+
+_NEXT_WEEKDAY_RE = re.compile(
+    r"\b(?:next|this)\s+(mon|tue|wed|thu|fri|sat|sun)", re.I)
+
+
+def _dp(phrase: str, base: datetime):
+    """Parse a natural date/time phrase as KST, anchored to `base` (naive KST)."""
+    # dateparser returns None for "next/this <weekday>"; drop the qualifier and
+    # let PREFER_DATES_FROM=future resolve the upcoming weekday. It also doesn't
+    # know "tonight" — treat it as today (the time part carries the hour).
+    phrase = _NEXT_WEEKDAY_RE.sub(r"\1", phrase or "")
+    phrase = re.sub(r"\btonight\b", "today", phrase, flags=re.I)
+    return dateparser.parse(phrase, settings={
+        "TIMEZONE": "Asia/Seoul",
+        "RETURN_AS_TIMEZONE_AWARE": True,
+        "PREFER_DATES_FROM": "future",
+        "RELATIVE_BASE": base,
+    })
+
+
+def _resolve_times(spec: dict):
+    """Turn time_phrase/end_phrase/duration into exact KST start/end. dateparser
+    does ALL date math, so relatives ('next Friday', 'tomorrow 7pm') are exact."""
+    now_kst = datetime.now(KST).replace(tzinfo=None)
+    start = _dp(spec.get("time_phrase") or "", now_kst)
+    if not start:
+        return None, None, None
+    end = None
+    if spec.get("end_phrase"):
+        parsed_end = _dp(spec["end_phrase"], start.replace(tzinfo=None))
+        if parsed_end:
+            # A range like "7pm–8pm" gives a time-only end: pin it to the start's
+            # date (rolling past midnight if needed) rather than trust its date.
+            end = start.replace(hour=parsed_end.hour, minute=parsed_end.minute,
+                                second=0, microsecond=0)
+            if end <= start:
+                end += timedelta(days=1)
+    if not end:
+        try:
+            dur = int(spec.get("duration_minutes") or 60)
+        except (TypeError, ValueError):
+            dur = 60
+        end = start + timedelta(minutes=dur)
+    return start, end, _to_rrule(spec.get("recurrence"))
+
+
+def _t(dt: datetime) -> str:
+    return dt.strftime("%-I:%M%p").lower()           # e.g. 7:00pm
+
+
+def _fmt_range(start: datetime, end: datetime) -> str:
+    if start.date() == end.date():
+        return f"{start.strftime('%a %b %-d')}, {_t(start)}–{_t(end)}"
+    return f"{start.strftime('%a %b %-d')} {_t(start)} – {end.strftime('%a %b %-d')} {_t(end)}"
+
+
+def _event_range(ev: dict) -> str:
+    """Human range for an existing Google event."""
+    s = ev.get("start", {}).get("dateTime") or ev.get("start", {}).get("date")
+    e = ev.get("end", {}).get("dateTime") or ev.get("end", {}).get("date")
+    try:
+        sd = datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(KST)
+        ed = datetime.fromisoformat(e.replace("Z", "+00:00")).astimezone(KST)
+        return _fmt_range(sd, ed)
+    except Exception:
+        return s or "?"
+
+
+def _search_events(user_id: str, reference: str, max_results: int = 5):
+    """Search upcoming events matching a reference. None = not connected."""
+    service = _calendar_service(user_id)
+    if not service:
+        return None
+    try:
+        time_min = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        result = service.events().list(
+            calendarId="primary", q=reference, timeMin=time_min,
+            maxResults=max_results, singleEvents=True, orderBy="startTime",
+        ).execute()
+        return result.get("items", [])
+    except Exception as e:
+        print(f"[cal] search failed: {e}")
+        return []
+
+
+_CAL_BTNS = lambda op_id: [("✅ Yes", f"cal:yes:{op_id}"), ("❌ No", f"cal:no:{op_id}")]
+
+
+def try_calendar_fastpath(user_id: str, text: str) -> bool:
+    """Handle a simple calendar add/edit/delete. Returns True if handled (a
+    confirm was sent or a clear message given); False to fall through to the
+    full tool loop. Blocking — call via asyncio.to_thread."""
+    if not _cal_gate(text):
+        return False
+    spec = _extract_calendar(text)
+    if not spec or spec.get("action") not in ("add", "edit", "delete"):
+        return False
+    action = spec["action"]
+
+    if action == "add":
+        start, end, rrule = _resolve_times(spec)
+        if not start:
+            return False                      # couldn't parse → let the full loop try
+        title = (spec.get("title") or "Event").strip()
+        op_id = uuid.uuid4().hex
+        pending_calendar[op_id] = {
+            "user_id": user_id, "type": "add", "title": title,
+            "start": start, "end": end, "rrule": rrule,
+            "summary": f"{title} — {_fmt_range(start, end)}",
+        }
+        rec = f" (repeats {spec.get('recurrence')})" if rrule else ""
+        _send_telegram(user_id, f"📅 {title} — {_fmt_range(start, end)}.{rec}\nAdd it?",
+                       buttons=_CAL_BTNS(op_id))
+        return True
+
+    # edit / delete: find the event first, then confirm the match.
+    ref = (spec.get("event_reference") or spec.get("title") or "").strip()
+    if not ref:
+        return False
+    matches = _search_events(user_id, ref)
+    if matches is None:
+        _send_telegram(user_id, "Google Calendar not connected. Send /connect to link it.")
+        return True
+    if not matches:
+        _send_telegram(user_id, f"Couldn't find a calendar event matching '{ref}'.")
+        return True
+    ev = matches[0]
+    summary = ev.get("summary", "(untitled)")
+    extra = f"\n(+{len(matches) - 1} other match — tap No to cancel)" if len(matches) > 1 else ""
+    op_id = uuid.uuid4().hex
+
+    if action == "delete":
+        pending_calendar[op_id] = {
+            "user_id": user_id, "type": "delete", "event_id": ev["id"],
+            "summary": f"{summary} — {_event_range(ev)}",
+        }
+        _send_telegram(user_id, f"🗑️ Delete '{summary}' — {_event_range(ev)}?{extra}",
+                       buttons=_CAL_BTNS(op_id))
+        return True
+
+    # edit = move to a new time
+    start, end, _ = _resolve_times(spec)
+    if not start:
+        _send_telegram(user_id, f"Found '{summary}', but couldn't parse the new time. "
+                                "Try e.g. 'move it to Friday 3pm'.")
+        return True
+    pending_calendar[op_id] = {
+        "user_id": user_id, "type": "edit", "event_id": ev["id"],
+        "start": start, "end": end,
+        "summary": f"{summary} → {_fmt_range(start, end)}",
+    }
+    _send_telegram(
+        user_id,
+        f"📅 Move '{summary}'\nfrom {_event_range(ev)}\nto {_fmt_range(start, end)}?{extra}",
+        buttons=_CAL_BTNS(op_id),
+    )
+    return True
+
+
+def commit_calendar_op(user_id: str, op_id: str) -> str:
+    """Called only after a Yes tap. Performs the Google API write."""
+    op = pending_calendar.pop(op_id, None)
+    if not op or op.get("user_id") != user_id:
+        return "That calendar request has expired."
+    service = _calendar_service(user_id)
+    if not service:
+        return "Google Calendar not connected. Send /connect to link it."
+    try:
+        if op["type"] == "add":
+            body = {
+                "summary": op["title"],
+                "start": {"dateTime": op["start"].isoformat(), "timeZone": "Asia/Seoul"},
+                "end": {"dateTime": op["end"].isoformat(), "timeZone": "Asia/Seoul"},
+            }
+            if op.get("rrule"):
+                body["recurrence"] = [op["rrule"]]
+            service.events().insert(calendarId="primary", body=body).execute()
+            return f"✅ Added: {op['summary']}"
+        if op["type"] == "edit":
+            service.events().patch(
+                calendarId="primary", eventId=op["event_id"],
+                body={
+                    "start": {"dateTime": op["start"].isoformat(), "timeZone": "Asia/Seoul"},
+                    "end": {"dateTime": op["end"].isoformat(), "timeZone": "Asia/Seoul"},
+                },
+            ).execute()
+            return f"✅ Moved: {op['summary']}"
+        if op["type"] == "delete":
+            service.events().delete(calendarId="primary", eventId=op["event_id"]).execute()
+            return f"🗑️ Deleted: {op['summary']}"
+    except Exception as e:
+        return f"Calendar error: {e}"
+    return "Unknown calendar operation."
+
+
+# ---------------------------------------------------------------------------
 # Telegram handlers
 # ---------------------------------------------------------------------------
 
@@ -849,6 +1258,198 @@ async def handle_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def _authorized_command(update: Update) -> str | None:
+    user_id = str(update.effective_user.id)
+    if not _is_authorized(user_id):
+        await update.message.reply_text("Sorry, this is a private bot.")
+        return None
+    return user_id
+
+
+async def handle_geoloc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _authorized_command(update):
+        return
+    await update.message.reply_text(
+        "Open the attachment menu in Telegram, choose Location, and select Share My Live Location. "
+        "I only receive updates while you actively share your live location. You can stop sharing "
+        "in Telegram at any time or send /location_off."
+    )
+
+
+async def handle_location_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = await _authorized_command(update)
+    if not user_id:
+        return
+    s = await asyncio.to_thread(habit_repo.ensure_settings, user_id)
+    last = s.get("last_location_at") or "never"
+    state = "on" if s.get("tracking_enabled", True) else "off"
+    await update.message.reply_text(f"Location processing is {state}. Last location update: {last}.")
+
+
+async def handle_location_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = await _authorized_command(update)
+    if not user_id:
+        return
+    await asyncio.to_thread(habit_repo.update_settings, user_id, tracking_enabled=False)
+    await update.message.reply_text("Location processing is off. Telegram live sharing can also be stopped in Telegram.")
+
+
+async def handle_nudges_setting(update: Update, context: ContextTypes.DEFAULT_TYPE, enabled: bool) -> None:
+    user_id = await _authorized_command(update)
+    if not user_id:
+        return
+    await asyncio.to_thread(habit_repo.update_settings, user_id, nudges_enabled=enabled)
+    await update.message.reply_text("Proactive notifications are on." if enabled else "Proactive notifications are off.")
+
+
+async def handle_nudges_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await handle_nudges_setting(update, context, True)
+
+
+async def handle_nudges_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await handle_nudges_setting(update, context, False)
+
+
+async def handle_nudges_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = await _authorized_command(update)
+    if not user_id:
+        return
+    s = await asyncio.to_thread(habit_repo.ensure_settings, user_id)
+    today = await asyncio.to_thread(habit_repo.nudges_today, user_id, habit_nudges._day_start(s.get("timezone") or "Asia/Seoul"))
+    await update.message.reply_text(
+        f"Nudges: {'on' if s.get('nudges_enabled', True) else 'off'}\n"
+        f"Passive habit suggestions: {'on' if s.get('habit_suggestions_enabled', True) else 'off'}\n"
+        f"Daily limit: {s.get('daily_nudge_limit') or 3}\n"
+        f"Sent today: {today}"
+    )
+
+
+async def handle_visits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = await _authorized_command(update)
+    if not user_id:
+        return
+    rows = await asyncio.to_thread(habit_repo.list_visits, user_id, 10)
+    if not rows:
+        await update.message.reply_text("No confirmed visits yet.")
+        return
+    lines = [
+        f"[{str(r['id'])[:8]}] {r['place_name']} — {r['normalized_category']} — {r['confirmed_at']}"
+        for r in rows
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+
+async def handle_habit_watchers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = await _authorized_command(update)
+    if not user_id:
+        return
+    rows = await asyncio.to_thread(habit_watchers.list_habit_watchers, user_id)
+    if not rows:
+        await update.message.reply_text("No active habit watchers.")
+        return
+    lines = []
+    for r in rows:
+        target = r.get("target_brand") or r.get("target_category") or r.get("target_place_id") or "target"
+        lines.append(f"[{str(r['id'])[:8]}] {r['rule_type']} — {target}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def handle_habit_suggestions_setting(update: Update, context: ContextTypes.DEFAULT_TYPE, enabled: bool) -> None:
+    user_id = await _authorized_command(update)
+    if not user_id:
+        return
+    await asyncio.to_thread(habit_repo.update_settings, user_id, habit_suggestions_enabled=enabled)
+    await update.message.reply_text(
+        "Passive habit suggestions are on." if enabled else "Passive habit suggestions are off."
+    )
+
+
+async def handle_habit_suggestions_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await handle_habit_suggestions_setting(update, context, True)
+
+
+async def handle_habit_suggestions_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await handle_habit_suggestions_setting(update, context, False)
+
+
+async def handle_delete_watcher(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = await _authorized_command(update)
+    if not user_id:
+        return
+    if not context.args:
+        await update.message.reply_text("Use /delete_watcher <id>.")
+        return
+    ok = await asyncio.to_thread(habit_watchers.delete_habit_watcher, user_id, context.args[0])
+    await update.message.reply_text("Deleted watcher." if ok else "No watcher matched that id.")
+
+
+async def handle_forget_locations(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = await _authorized_command(update)
+    if not user_id:
+        return
+    pending_forget[user_id] = "locations"
+    await update.message.reply_text("This will delete stored location updates, candidates, and visits. Reply 'yes' to confirm.")
+
+
+async def handle_forget_habits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = await _authorized_command(update)
+    if not user_id:
+        return
+    pending_forget[user_id] = "habits"
+    await update.message.reply_text("This will delete habit rules, suggestions, and related nudge history. Reply 'yes' to confirm.")
+
+
+async def handle_location_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = str(update.effective_user.id)
+    if not _is_authorized(user_id):
+        print(f"[auth] blocked location from user {user_id}")
+        return
+    msg = update.edited_message or update.message
+    if not msg or not msg.location:
+        return
+    loc = msg.location
+    await asyncio.to_thread(cleanup_location_retention, habit_repo, user_id)
+    await habit_location.handle_location(
+        user_id,
+        loc.latitude,
+        loc.longitude,
+        getattr(loc, "horizontal_accuracy", None),
+    )
+
+
+def _habit_threshold_from_text(text: str) -> int | None:
+    low = text.lower()
+    if "twice" in low or "two" in low:
+        return 2
+    m = re.search(r"\b(\d+)\b", low)
+    return int(m.group(1)) if m else None
+
+
+def _maybe_start_habit_request(user_id: str, text: str) -> bool:
+    low = text.lower()
+    if "fast food" in low and any(w in low for w in ("tell", "let me know", "track", "watch", "frequently")):
+        threshold = _habit_threshold_from_text(text)
+        if not threshold:
+            pending_habit_watchers[user_id] = {"target_category": "fast_food"}
+            _send_telegram(user_id, "What limit would you like to use? For example, more than two fast-food visits per week.")
+            return True
+        habit_watchers.create_habit_watcher(
+            user_id, "weekly_visit_limit", target_category="fast_food",
+            threshold_count=threshold, window_days=7,
+        )
+        _send_telegram(user_id, f"Got it. I'll let you know when you exceed {threshold} fast-food visits during a calendar week.")
+        return True
+    if "grocery" in low and "remind me" in low:
+        reminder = text.split("remind me to", 1)[-1].strip() if "remind me to" in low else text
+        habit_watchers.create_habit_watcher(
+            user_id, "near_category_reminder", target_category="grocery_store",
+            reminder_text=reminder,
+        )
+        _send_telegram(user_id, "Got it. I'll remind you when you are near a grocery store.")
+        return True
+    return False
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
     if not _is_authorized(user_id):
@@ -856,6 +1457,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Sorry, this is a private bot.")
         return
     user_text = update.message.text
+
+    if user_id in pending_forget:
+        decision = _classify_confirmation(user_text)
+        if decision == "send":
+            target = pending_forget.pop(user_id)
+            if target == "locations":
+                await asyncio.to_thread(habit_repo.delete_locations, user_id)
+                await update.message.reply_text("Deleted stored location data and turned location processing off.")
+            else:
+                await asyncio.to_thread(habit_repo.delete_habits, user_id)
+                await update.message.reply_text("Deleted habit rules, suggestions, and habit nudge history.")
+            return
+        if decision == "cancel":
+            pending_forget.pop(user_id)
+            await update.message.reply_text("Cancelled. Nothing was deleted.")
+            return
+        await update.message.reply_text("Reply 'yes' to confirm deletion or 'no' to cancel.")
+        return
 
     # Confirm-before-send: if a draft is pending, this message is the yes/no decision.
     if user_id in pending_emails:
@@ -874,8 +1493,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
+    if user_id in pending_habit_watchers:
+        threshold = _habit_threshold_from_text(user_text)
+        if threshold:
+            pending_habit_watchers.pop(user_id, None)
+            await asyncio.to_thread(
+                habit_watchers.create_habit_watcher,
+                user_id, "weekly_visit_limit", "fast_food", None, threshold, 7, None,
+            )
+            await update.message.reply_text(
+                f"Got it. I'll let you know when you exceed {threshold} fast-food visits during a calendar week."
+            )
+            return
+        await update.message.reply_text("Please send a limit like 'more than twice per week'.")
+        return
+
+    if await asyncio.to_thread(_maybe_start_habit_request, user_id, user_text):
+        return
+
     # Keyword automations: if the message matches a saved phrase, fire and stop.
     if await asyncio.to_thread(match_keyword_automations, user_id, user_text):
+        return
+
+    # Calendar fast-path: cheap add/edit/delete that skips the full tool loop.
+    if await asyncio.to_thread(try_calendar_fastpath, user_id, user_text):
         return
 
     if user_id not in conversation_history:
@@ -1463,7 +2104,8 @@ def match_keyword_automations(user_id: str, text: str) -> bool:
 # Management tools are noise for pattern detection — don't log them as activity.
 SKIP_LOG = {
     "create_automation", "list_automations", "set_automation", "delete_automation",
-    "set_suggestions", "send_message",
+    "set_suggestions", "send_message", "create_habit_watcher", "list_habit_watchers",
+    "delete_habit_watcher", "set_habit_suggestions_enabled", "get_recent_place_visits",
 }
 
 SUGGEST_STATE = Path(__file__).with_name("suggestion_state.json")
@@ -1749,6 +2391,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif kind == "act" and action == "skip":
         pending_actions.pop(ref, None)
         msg = "👍 Skipped."
+    elif kind == "cal" and action == "yes":
+        msg = await asyncio.to_thread(commit_calendar_op, user_id, ref)
+    elif kind == "cal" and action == "no":
+        pending_calendar.pop(ref, None)
+        msg = "🚫 Cancelled."
+    elif kind == "habit" and action == "yes":
+        msg = await asyncio.to_thread(habit_policies.confirm_habit_suggestion, user_id, ref, True)
+    elif kind == "habit" and action == "no":
+        msg = await asyncio.to_thread(habit_policies.confirm_habit_suggestion, user_id, ref, False)
+    elif kind == "habit" and action == "mute":
+        msg = await asyncio.to_thread(habit_policies.mute_suggestion_category, user_id, ref)
     else:
         return
     try:
@@ -1826,7 +2479,22 @@ def main() -> None:
         print(f"[auth] bot restricted to user id(s): {', '.join(sorted(ALLOWED_USER_IDS))}")
     app = ApplicationBuilder().token(token).post_init(_post_init).build()
     app.add_handler(CommandHandler("connect", handle_connect))
+    app.add_handler(CommandHandler("geoloc", handle_geoloc))
+    app.add_handler(CommandHandler("location_status", handle_location_status))
+    app.add_handler(CommandHandler("location_off", handle_location_off))
+    app.add_handler(CommandHandler("nudges_on", handle_nudges_on))
+    app.add_handler(CommandHandler("nudges_off", handle_nudges_off))
+    app.add_handler(CommandHandler("nudges_status", handle_nudges_status))
+    app.add_handler(CommandHandler("visits", handle_visits))
+    app.add_handler(CommandHandler("habit_watchers", handle_habit_watchers))
+    app.add_handler(CommandHandler("habit_suggestions_on", handle_habit_suggestions_on))
+    app.add_handler(CommandHandler("habit_suggestions_off", handle_habit_suggestions_off))
+    app.add_handler(CommandHandler("delete_watcher", handle_delete_watcher))
+    app.add_handler(CommandHandler("forget_locations", handle_forget_locations))
+    app.add_handler(CommandHandler("forget_habits", handle_forget_habits))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.LOCATION, handle_location_update))
+    app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.LOCATION, handle_location_update))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Bot running — press Ctrl+C to stop")
     app.run_polling()
