@@ -1,0 +1,14 @@
+# Secrets come from Railway env vars, never baked into the image.
+.env
+# Local-only session/state — regenerated on Railway via headless login.
+uni_auth_state.json
+uni_daily_state.json
+uni_api_grades.json
+# Build/runtime junk.
+venv/
+__pycache__/
+*.pyc
+*.log
+*.png
+.git/
+.DS_Store

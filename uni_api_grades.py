@@ -14,6 +14,8 @@ import argparse
 import json
 import os
 import re
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -83,6 +85,11 @@ class Api:
 
 
 def fetch_grades() -> list[dict]:
+    # On a fresh container (Railway wipes disk on deploy) there's no saved
+    # session — create one via headless login before fetching.
+    if not AUTH_STATE_PATH.exists():
+        refresh = Path(__file__).with_name("uni_refresh_session.py")
+        subprocess.run([sys.executable, str(refresh)], timeout=180)
     if not AUTH_STATE_PATH.exists():
         raise SystemExit("Missing uni_auth_state.json. Run python uni_login_test.py first.")
 

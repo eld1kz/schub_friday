@@ -814,6 +814,59 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(reply)
 
 
+# ---------------------------------------------------------------------------
+# Background scheduler — one Railway service runs the bot + digest + reminders
+# ---------------------------------------------------------------------------
+
+DIGEST_SCRIPT = Path(__file__).with_name("daily_digest.py")
+REMINDER_SCRIPT = Path(__file__).with_name("reminder_check.py")
+REFRESH_SCRIPT = Path(__file__).with_name("uni_refresh_session.py")
+ENABLE_SCHEDULER = os.environ.get("ENABLE_SCHEDULER", "1") != "0"
+
+
+async def _run_script(*args: str) -> None:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, *args,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        out, _ = await proc.communicate()
+        if out:
+            print(f"[sched] {Path(args[0]).name}: {out.decode(errors='replace').strip()[:300]}")
+    except Exception as e:
+        print(f"[sched] failed {args}: {e}")
+
+
+async def _scheduler() -> None:
+    # Bootstrap the LMS session so grades work right after a (re)deploy.
+    await _run_script(str(REFRESH_SCRIPT))
+    last_reminder = 0.0
+    fired: dict[str, set] = {}
+    while True:
+        try:
+            now = datetime.now(KST)
+            t = asyncio.get_event_loop().time()
+            if t - last_reminder >= 900:                  # reminders every 15 min
+                last_reminder = t
+                await _run_script(str(REMINDER_SCRIPT))
+            done = fired.setdefault(now.date().isoformat(), set())
+            if now.hour == 9 and "m" not in done:         # morning digest, 09:00 KST
+                done.add("m")
+                await _run_script(str(DIGEST_SCRIPT))
+            if now.hour == 21 and "e" not in done:        # evening digest, 21:00 KST
+                done.add("e")
+                await _run_script(str(DIGEST_SCRIPT), "--evening")
+        except Exception as e:
+            print(f"[sched] loop error: {e}")
+        await asyncio.sleep(60)
+
+
+async def _post_init(application) -> None:
+    if ENABLE_SCHEDULER:
+        application.create_task(_scheduler())
+        print("[sched] background scheduler started (digest + reminders)")
+
+
 def main() -> None:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     if not ALLOWED_USER_IDS:
@@ -821,7 +874,7 @@ def main() -> None:
               "bot will deny everyone. Set your Telegram id to use it.")
     else:
         print(f"[auth] bot restricted to user id(s): {', '.join(sorted(ALLOWED_USER_IDS))}")
-    app = ApplicationBuilder().token(token).build()
+    app = ApplicationBuilder().token(token).post_init(_post_init).build()
     app.add_handler(CommandHandler("connect", handle_connect))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Bot running — press Ctrl+C to stop")
