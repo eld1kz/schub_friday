@@ -25,6 +25,7 @@ load_dotenv(HERE / ".env")
 
 import assistant_step4 as bot                     # calendar/gmail helpers, claude, supabase
 import uni_daily                                  # refresh_session, diff, state
+import weather                                     # free forecast + plain-rule advice tips
 from uni_api_grades import fetch_grades, format_assignments
 
 SSL_CTX = ssl.create_default_context(cafile=certifi.where())
@@ -139,6 +140,12 @@ def main() -> None:
             messages=[{"role": "user", "content": context}],
         )
         text = "".join(b.text for b in resp.content if hasattr(b, "text")).strip()
+
+        # Morning only: prepend today's forecast + any umbrella/SPF/etc tips so the
+        # warning is right there before leaving. Plain code, no extra LLM call.
+        if not args.evening:
+            text = f"{weather.weather_block()}\n\n{text}"
+
         print(text)
         send_telegram(text)
 

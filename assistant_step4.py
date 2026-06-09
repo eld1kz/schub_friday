@@ -42,6 +42,7 @@ from places_provider import CachedPlacesProvider, GooglePlacesProvider
 from retention_cleanup import cleanup_location_retention
 from visit_detection_service import VisitDetectionService
 from watcher_service import WatcherService
+import weather
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -121,8 +122,8 @@ BASE_SYSTEM_PROMPT = (
     "You are a concise, friendly personal assistant. "
     "Keep replies short and direct. No unnecessary filler. "
     "You have tools to check the time, save reminders, search the web, "
-    "manage the user's Google Calendar, read and send Gmail, and check the "
-    "user's university grades and assignments. "
+    "manage the user's Google Calendar, read and send Gmail, check the "
+    "user's university grades and assignments, and check today's weather. "
     "When the user asks to send an email, call send_email to prepare a draft. "
     "It does NOT send immediately — show the user the drafted email and tell "
     "them to reply 'yes' to send or 'no' to cancel. "
@@ -346,6 +347,13 @@ TOOLS = [
             "properties": {"limit": {"type": "integer"}},
             "required": [],
         },
+    },
+    {
+        "name": "get_weather",
+        "description": "Returns today's Seoul forecast (current temp, high/low, rain "
+                       "probability, UV) plus any contextual tips like bringing an umbrella. "
+                       "Use when the user asks about the weather.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
     },
 ]
 
@@ -704,6 +712,9 @@ def run_tool(name: str, tool_input: dict, user_id: str) -> str:
             for r in rows
         )
 
+    if name == "get_weather":
+        return weather.weather_block()
+
     if name == "send_email":
         # Do NOT send here. Stash the draft; the user confirms in their next message.
         pending_emails[user_id] = {
@@ -861,6 +872,7 @@ TOOL_STATUS = {
     "send_email": "📤 Preparing the draft...",
     "check_grades": "🎓 Checking your grades...",
     "check_assignments": "📝 Checking your assignments...",
+    "get_weather": "🌤 Checking the weather...",
 }
 
 
