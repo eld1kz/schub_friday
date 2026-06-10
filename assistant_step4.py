@@ -40,6 +40,8 @@ from location_service import LocationService
 from nudge_service import NudgeService
 from places_provider import CachedPlacesProvider, GooglePlacesProvider
 from retention_cleanup import cleanup_location_retention
+from study_planner_service import StudyPlannerService
+from study_repository import SupabaseStudyRepository
 from visit_detection_service import VisitDetectionService
 from watcher_service import WatcherService
 import weather
@@ -62,6 +64,7 @@ habit_location = LocationService(
     habit_watchers,
     habit_policies,
 )
+study_planner = StudyPlannerService(SupabaseStudyRepository(supabase), claude)
 
 conversation_history: dict[str, deque] = {}
 # Email drafts awaiting the user's yes/no confirmation before send_email sends.
@@ -135,7 +138,14 @@ BASE_SYSTEM_PROMPT = (
     "suggest automations; if the user asks to stop or resume those suggestions, "
     "call set_suggestions. For habit/location tracking, only create watcher rules "
     "when the user explicitly asks. Use neutral language; never diagnose health or "
-    "claim one visit proves a problem."
+    "claim one visit proves a problem. "
+    "You are also a study/dev planner. When the user asks to plan their week or a "
+    "course ('plan my week for OS + ML'), call create_study_plan; set "
+    "include_resources true only if they want fresh resources/links. Relay the "
+    "returned plan text verbatim — do not rewrite it. Use get_study_plan to show "
+    "the plan, update_study_task for 'mark X as coded/done', log_study_result when "
+    "a message starts with 'log:' or reports a study result, and study_reflection "
+    "for 'review my week' / 'what did I learn'."
 )
 
 
@@ -354,6 +364,74 @@ TOOLS = [
                        "probability, UV) plus any contextual tips like bringing an umbrella. "
                        "Use when the user asks about the weather.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "create_study_plan",
+        "description": "Generates and saves a personalized weekly study/dev plan from the "
+                       "user's request (e.g. 'plan my week for OS + ML + side project'). "
+                       "Injects the user's learning-profile insights and recent study logs. "
+                       "Replaces the current active plan. Returns the formatted plan — show "
+                       "it to the user verbatim.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "request": {"type": "string", "description": "The user's planning request, verbatim"},
+                "include_resources": {
+                    "type": "boolean",
+                    "description": "true only if the user wants fresh resources/links researched via web search",
+                },
+            },
+            "required": ["request"],
+        },
+    },
+    {
+        "name": "get_study_plan",
+        "description": "Shows the user's current active study plan with each task's "
+                       "pipeline status. Returns formatted text — show it verbatim.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "update_study_task",
+        "description": "Moves one task in the active study plan to a new pipeline status. "
+                       "Reference the task by a distinctive part of its title or course, "
+                       "e.g. 'mutex' for 'mark OS mutex task as coded'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "Part of the task title or course name"},
+                "status": {
+                    "type": "string",
+                    "enum": ["idea", "researched", "coded", "tested", "reviewed", "done"],
+                },
+            },
+            "required": ["ref", "status"],
+        },
+    },
+    {
+        "name": "log_study_result",
+        "description": "Saves a study/dev log entry ('log: OS midterm 92%, Pomodoro worked "
+                       "well'). Logs feed the learning loop that personalizes future plans. "
+                       "Pass the user's log text verbatim.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "The log text, verbatim"},
+            },
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "study_reflection",
+        "description": "Analyzes recent study logs and task completion ('review my week', "
+                       "'what did I learn last week?'): returns a summary and updates the "
+                       "learning-profile insights used by future plans.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": "Lookback window in days (default 7)"},
+            },
+            "required": [],
+        },
     },
 ]
 
@@ -715,6 +793,31 @@ def run_tool(name: str, tool_input: dict, user_id: str) -> str:
     if name == "get_weather":
         return weather.weather_block()
 
+    if name == "create_study_plan":
+        try:
+            return study_planner.generate_plan(
+                user_id, tool_input["request"],
+                extra_context=fetch_memories(user_id),
+                include_resources=tool_input.get("include_resources", False),
+            )
+        except Exception as e:
+            return f"Could not generate the plan: {e}"
+
+    if name == "get_study_plan":
+        return study_planner.show_current_plan(user_id)
+
+    if name == "update_study_task":
+        return study_planner.update_task_status(user_id, tool_input["ref"], tool_input["status"])
+
+    if name == "log_study_result":
+        return study_planner.log_result(user_id, tool_input["text"])
+
+    if name == "study_reflection":
+        try:
+            return study_planner.reflect(user_id, days=int(tool_input.get("days", 7)))
+        except Exception as e:
+            return f"Could not run the reflection: {e}"
+
     if name == "send_email":
         # Do NOT send here. Stash the draft; the user confirms in their next message.
         pending_emails[user_id] = {
@@ -873,6 +976,11 @@ TOOL_STATUS = {
     "check_grades": "🎓 Checking your grades...",
     "check_assignments": "📝 Checking your assignments...",
     "get_weather": "🌤 Checking the weather...",
+    "create_study_plan": "📚 Building your study plan...",
+    "get_study_plan": "📚 Fetching your plan...",
+    "update_study_task": "✅ Updating the task...",
+    "log_study_result": "📓 Saving your log...",
+    "study_reflection": "🪞 Reviewing your week...",
 }
 
 
