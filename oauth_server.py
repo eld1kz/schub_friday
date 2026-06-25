@@ -15,16 +15,20 @@ os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"    # don't error if Google return
 
 from datetime import timezone
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from google_auth_oauthlib.flow import Flow
 from supabase import create_client
 import uvicorn
 
+from health_repository import SupabaseHealthRepository
+from health_service import HealthService
+
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
 app = FastAPI()
 db = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+health_service = HealthService(SupabaseHealthRepository(db))
 
 REDIRECT_URI = os.environ.get("OAUTH_REDIRECT_URI", "http://localhost:8080/oauth/callback")
 SCOPES = [
@@ -99,6 +103,32 @@ async def oauth_callback(code: str, state: str):
         return HTMLResponse(
             f"<pre style='color:red'>{tb}</pre>", status_code=500
         )
+
+
+@app.post("/health/ingest")
+async def health_ingest(request: Request, x_health_token: str = Header(default="")):
+    """
+    Receives daily Apple Health metrics POSTed by the iPhone Shortcut.
+
+    Auth: an `X-Health-Token` header must match HEALTH_INGEST_TOKEN. The user is
+    taken from the payload's `user_id`, falling back to TELEGRAM_CHAT_ID (this is
+    a single-user personal bot). A re-POST for the same day overwrites that day.
+    """
+    expected = os.environ.get("HEALTH_INGEST_TOKEN", "")
+    if not expected or x_health_token != expected:
+        raise HTTPException(status_code=401, detail="bad token")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="body must be JSON")
+
+    try:
+        row = health_service.ingest(payload, os.environ.get("TELEGRAM_CHAT_ID", ""))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {"ok": True, "date": row.get("metric_date")}
 
 
 if __name__ == "__main__":
