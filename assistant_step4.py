@@ -2607,10 +2607,15 @@ def _start_oauth_server() -> None:
 
     port = int(os.environ.get("PORT", "8080"))
 
-    def _serve() -> None:
-        uvicorn.run(oauth_server.app, host="0.0.0.0", port=port, log_level="warning")
+    # uvicorn.run() installs OS signal handlers, which only works in the main
+    # thread; run_polling() owns that thread, so we drive the Server manually
+    # and skip signal handling in this worker thread.
+    config = uvicorn.Config(oauth_server.app, host="0.0.0.0", port=port,
+                            log_level="warning")
+    server = uvicorn.Server(config)
+    server.install_signal_handlers = lambda: None
 
-    threading.Thread(target=_serve, daemon=True).start()
+    threading.Thread(target=server.run, daemon=True).start()
     print(f"[oauth] callback server listening on 0.0.0.0:{port}")
 
 
