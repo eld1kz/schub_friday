@@ -47,12 +47,21 @@ class HealthService:
 
     # ---- ingest (called by the /health/ingest endpoint) -------------------
     def ingest(self, payload: dict, default_user_id: str) -> dict:
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a JSON object")
+
         user_id = str(payload.get("user_id") or default_user_id or "").strip()
         if not user_id:
             raise ValueError("no user_id (set TELEGRAM_CHAT_ID or send user_id)")
 
-        metric_date = str(payload.get("date") or "").strip() \
-            or datetime.now(timezone.utc).date().isoformat()
+        # Accept only a clean YYYY-MM-DD; anything else falls back to today so a
+        # malformed date from the Shortcut can't 500 the insert.
+        today = datetime.now(timezone.utc).date().isoformat()
+        metric_date = str(payload.get("date") or "").strip()
+        try:
+            date.fromisoformat(metric_date)
+        except ValueError:
+            metric_date = today
 
         row = {"user_id": user_id, "metric_date": metric_date, "raw": payload}
         for key, value in payload.items():

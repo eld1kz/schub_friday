@@ -127,6 +127,9 @@ async def health_ingest(request: Request, x_health_token: str = Header(default="
         row = health_service.ingest(payload, os.environ.get("TELEGRAM_CHAT_ID", ""))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        # Surface the real cause (e.g. a DB error) instead of an opaque 500.
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
     return {"ok": True, "date": row.get("metric_date")}
 
