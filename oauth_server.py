@@ -33,6 +33,14 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
 ]
 
+# Friendly labels for the scopes we request, shown on the success page so the
+# user sees everything they actually connected (not just Calendar).
+SCOPE_LABELS = {
+    "https://www.googleapis.com/auth/calendar": "Google Calendar",
+    "https://www.googleapis.com/auth/gmail.readonly": "Gmail (read)",
+    "https://www.googleapis.com/auth/gmail.send": "Gmail (send)",
+}
+
 CLIENT_CONFIG = {
     "web": {
         "client_id": os.environ["GOOGLE_CLIENT_ID"],
@@ -73,9 +81,14 @@ async def oauth_callback(code: str, state: str):
             "expiry": expiry.isoformat() if expiry else None,
         }).execute()
 
-        return HTMLResponse("""
+        # List what the user actually granted (Google may return a subset).
+        granted = creds.scopes or SCOPES
+        items = "".join(f"<li>{SCOPE_LABELS.get(s, s)}</li>" for s in granted)
+        return HTMLResponse(f"""
             <html><body style="font-family:sans-serif;text-align:center;padding:60px">
-            <h2>Google Calendar connected!</h2>
+            <h2>Connected!</h2>
+            <p>You've connected:</p>
+            <ul style="display:inline-block;text-align:left">{items}</ul>
             <p>You can close this tab and return to Telegram.</p>
             </body></html>
         """)
