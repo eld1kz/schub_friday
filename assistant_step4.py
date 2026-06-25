@@ -44,6 +44,8 @@ from study_planner_service import StudyPlannerService
 from study_repository import SupabaseStudyRepository
 from health_repository import SupabaseHealthRepository
 from health_service import HealthService
+from readiness_service import ReadinessService
+from workout_service import build as build_workout
 from visit_detection_service import VisitDetectionService
 from watcher_service import WatcherService
 import weather
@@ -68,6 +70,7 @@ habit_location = LocationService(
 )
 study_planner = StudyPlannerService(SupabaseStudyRepository(supabase), claude)
 health_service = HealthService(SupabaseHealthRepository(supabase))
+readiness_service = ReadinessService(health_service.repo)
 
 conversation_history: dict[str, deque] = {}
 # Email drafts awaiting the user's yes/no confirmation before send_email sends.
@@ -840,7 +843,11 @@ def run_tool(name: str, tool_input: dict, user_id: str) -> str:
         return weather.weather_block()
 
     if name == "get_health":
-        return health_service.status_summary(user_id)
+        status = readiness_service.check(user_id)
+        workout = build_workout(status)
+        header = (f"{status['summary']}\n"
+                  f"Today's session: {workout['summary']}")
+        return header + "\n\n" + health_service.status_summary(user_id)
 
     if name == "create_study_plan":
         try:
