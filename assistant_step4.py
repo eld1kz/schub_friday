@@ -104,7 +104,10 @@ def _normalize_remind_at(value: str) -> str:
         dt = dt.replace(tzinfo=KST)
     return dt.astimezone(timezone.utc).isoformat()
 
-REDIRECT_URI = "http://localhost:8080/oauth/callback"
+# On Railway, set OAUTH_REDIRECT_URI to https://<your-app>.up.railway.app/oauth/callback
+# and add that exact URL to the Google Cloud Console OAuth client. Falls back to
+# localhost for local development.
+REDIRECT_URI = os.environ.get("OAUTH_REDIRECT_URI", "http://localhost:8080/oauth/callback")
 CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar"]
 GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -1373,8 +1376,7 @@ async def handle_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         prompt="consent",
     )
     await update.message.reply_text(
-        "Open this link in a browser on the same computer as the bot, "
-        "then approve access:\n\n" + auth_url
+        "Open this link in any browser, then approve access:\n\n" + auth_url
     )
 
 
@@ -2590,7 +2592,30 @@ async def _post_init(application) -> None:
         print("[sched] background scheduler started (digest + reminders + automations)")
 
 
+def _start_oauth_server() -> None:
+    """
+    Serve the Google OAuth callback in-process so /connect works on Railway.
+
+    The bot itself uses long-polling (no inbound port), so we use Railway's
+    $PORT for the callback web server. Reuses oauth_server.app (the /oauth/callback
+    endpoint that exchanges the code and upserts tokens) rather than duplicating it.
+    Runs in a daemon thread with its own event loop, separate from run_polling.
+    """
+    import threading
+    import uvicorn
+    import oauth_server
+
+    port = int(os.environ.get("PORT", "8080"))
+
+    def _serve() -> None:
+        uvicorn.run(oauth_server.app, host="0.0.0.0", port=port, log_level="warning")
+
+    threading.Thread(target=_serve, daemon=True).start()
+    print(f"[oauth] callback server listening on 0.0.0.0:{port}")
+
+
 def main() -> None:
+    _start_oauth_server()
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     if not ALLOWED_USER_IDS:
         print("[auth] WARNING: no TELEGRAM_ALLOWED_IDS / TELEGRAM_CHAT_ID set — "

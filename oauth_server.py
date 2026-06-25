@@ -26,7 +26,7 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 app = FastAPI()
 db = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
-REDIRECT_URI = "http://localhost:8080/oauth/callback"
+REDIRECT_URI = os.environ.get("OAUTH_REDIRECT_URI", "http://localhost:8080/oauth/callback")
 SCOPES = [
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -89,4 +89,6 @@ async def oauth_callback(code: str, state: str):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8080)
+    # Railway sets $PORT and routes its public domain to 0.0.0.0:$PORT.
+    uvicorn.run(app, host=os.environ.get("HOST", "127.0.0.1"),
+                port=int(os.environ.get("PORT", "8080")))
