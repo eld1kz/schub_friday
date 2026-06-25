@@ -124,6 +124,29 @@ GOOGLE_CLIENT_CONFIG = {
     }
 }
 
+
+def _build_auth_url(user_id: str) -> str:
+    """
+    Build the Google OAuth consent URL. `state` carries the Telegram user_id
+    through Google's redirect so the callback knows whose tokens to save.
+    access_type=offline → returns a refresh_token; prompt=consent → always shows
+    the consent screen so we get a fresh refresh_token.
+    """
+    flow = Flow.from_client_config(
+        GOOGLE_CLIENT_CONFIG, scopes=SCOPES, redirect_uri=REDIRECT_URI,
+        autogenerate_code_verifier=False,
+    )
+    auth_url, _ = flow.authorization_url(
+        access_type="offline", state=user_id, prompt="consent",
+    )
+    return auth_url
+
+
+def _not_connected_msg(user_id: str, service: str) -> str:
+    """Shown when a Google feature is used before the account is connected."""
+    return (f"{service} isn't connected yet — you're still not connected. "
+            f"Open this link to connect, then try again:\n\n{_build_auth_url(user_id)}")
+
 BASE_SYSTEM_PROMPT = (
     "You are a concise, friendly personal assistant. "
     "Keep replies short and direct. No unnecessary filler. "
@@ -504,7 +527,7 @@ def _calendar_service(user_id: str):
 def list_upcoming_events(user_id: str, max_results: int = 5) -> str:
     service = _calendar_service(user_id)
     if not service:
-        return "Google Calendar not connected. Send /connect to link your account."
+        return _not_connected_msg(user_id, "Google Calendar")
     try:
         now = datetime.now(timezone.utc).isoformat()
         result = service.events().list(
@@ -528,7 +551,7 @@ def list_upcoming_events(user_id: str, max_results: int = 5) -> str:
 def create_calendar_event(user_id: str, title: str, start: str, end: str) -> str:
     service = _calendar_service(user_id)
     if not service:
-        return "Google Calendar not connected. Send /connect to link your account."
+        return _not_connected_msg(user_id, "Google Calendar")
     try:
         event = {
             "summary": title,
@@ -575,7 +598,7 @@ def _extract_body(payload: dict) -> str:
 def list_recent_emails(user_id: str, count: int = 5) -> str:
     service = _gmail_service(user_id)
     if not service:
-        return "Gmail not connected. Send /connect to link your account."
+        return _not_connected_msg(user_id, "Gmail")
     try:
         resp = service.users().messages().list(
             userId="me", maxResults=min(count, 10), labelIds=["INBOX"]
@@ -601,7 +624,7 @@ def list_recent_emails(user_id: str, count: int = 5) -> str:
 def read_email(user_id: str, message_id: str) -> str:
     service = _gmail_service(user_id)
     if not service:
-        return "Gmail not connected. Send /connect to link your account."
+        return _not_connected_msg(user_id, "Gmail")
     try:
         msg = service.users().messages().get(
             userId="me", id=message_id, format="full"
@@ -620,7 +643,7 @@ def _send_email_now(user_id: str, to: str, subject: str, body: str) -> str:
     """Actually send an email. Called only after the user confirms."""
     service = _gmail_service(user_id)
     if not service:
-        return "Gmail not connected. Send /connect to link your account."
+        return _not_connected_msg(user_id, "Gmail")
     try:
         message = EmailMessage()
         message["To"] = to
@@ -1272,7 +1295,7 @@ def try_calendar_fastpath(user_id: str, text: str) -> bool:
         return False
     matches = _search_events(user_id, ref)
     if matches is None:
-        _send_telegram(user_id, "Google Calendar not connected. Send /connect to link it.")
+        _send_telegram(user_id, _not_connected_msg(user_id, "Google Calendar"))
         return True
     if not matches:
         _send_telegram(user_id, f"Couldn't find a calendar event matching '{ref}'.")
@@ -1317,7 +1340,7 @@ def commit_calendar_op(user_id: str, op_id: str) -> str:
         return "That calendar request has expired."
     service = _calendar_service(user_id)
     if not service:
-        return "Google Calendar not connected. Send /connect to link it."
+        return _not_connected_msg(user_id, "Google Calendar")
     try:
         if op["type"] == "add":
             body = {
@@ -1349,36 +1372,6 @@ def commit_calendar_op(user_id: str, op_id: str) -> str:
 # ---------------------------------------------------------------------------
 # Telegram handlers
 # ---------------------------------------------------------------------------
-
-async def handle_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /connect — generates the Google OAuth URL and sends it to the user.
-
-    The `state` parameter carries the Telegram user_id through Google's
-    redirect back to our server, so the callback knows whose tokens to save.
-
-    access_type="offline" → Google returns a refresh_token (needed for long-term access).
-    prompt="consent"      → forces the consent screen every time, guaranteeing a
-                            fresh refresh_token even if the user connected before.
-    """
-    user_id = str(update.effective_user.id)
-    if not _is_authorized(user_id):
-        await update.message.reply_text("Sorry, this is a private bot.")
-        return
-    flow = Flow.from_client_config(
-        GOOGLE_CLIENT_CONFIG, scopes=SCOPES, redirect_uri=REDIRECT_URI,
-        autogenerate_code_verifier=False,   # disable PKCE: we have a client_secret, and the
-                                            # token exchange happens in a separate process
-    )
-    auth_url, _ = flow.authorization_url(
-        access_type="offline",
-        state=user_id,
-        prompt="consent",
-    )
-    await update.message.reply_text(
-        "Open this link in any browser, then approve access:\n\n" + auth_url
-    )
-
 
 async def _authorized_command(update: Update) -> str | None:
     user_id = str(update.effective_user.id)
@@ -2594,7 +2587,7 @@ async def _post_init(application) -> None:
 
 def _start_oauth_server() -> None:
     """
-    Serve the Google OAuth callback in-process so /connect works on Railway.
+    Serve the Google OAuth callback in-process so connecting works on Railway.
 
     The bot itself uses long-polling (no inbound port), so we use Railway's
     $PORT for the callback web server. Reuses oauth_server.app (the /oauth/callback
@@ -2628,7 +2621,6 @@ def main() -> None:
     else:
         print(f"[auth] bot restricted to user id(s): {', '.join(sorted(ALLOWED_USER_IDS))}")
     app = ApplicationBuilder().token(token).post_init(_post_init).build()
-    app.add_handler(CommandHandler("connect", handle_connect))
     app.add_handler(CommandHandler("geoloc", handle_geoloc))
     app.add_handler(CommandHandler("location_status", handle_location_status))
     app.add_handler(CommandHandler("location_off", handle_location_off))
