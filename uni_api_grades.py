@@ -95,7 +95,11 @@ def fetch_grades() -> list[dict]:
 
     results = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        # Same container-safe launch args as uni_refresh_session.py (Railway /dev/shm + sandbox).
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
         context = browser.new_context(storage_state=str(AUTH_STATE_PATH))
         api = Api(context.request)
 

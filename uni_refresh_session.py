@@ -46,7 +46,12 @@ def main() -> None:
         sys.exit("UNI_USERNAME / UNI_PASSWORD not set in .env")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        # Railway's container has a tiny /dev/shm and a seccomp sandbox that make
+        # a bare chromium.launch() crash on start; these args are the standard fix.
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
         context = browser.new_context()
         page = context.new_page()
         try:
