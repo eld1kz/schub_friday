@@ -42,6 +42,8 @@ from places_provider import CachedPlacesProvider, GooglePlacesProvider
 from retention_cleanup import cleanup_location_retention
 from study_planner_service import StudyPlannerService
 from study_repository import SupabaseStudyRepository
+from health_repository import SupabaseHealthRepository
+from health_service import HealthService
 from visit_detection_service import VisitDetectionService
 from watcher_service import WatcherService
 import weather
@@ -65,6 +67,7 @@ habit_location = LocationService(
     habit_policies,
 )
 study_planner = StudyPlannerService(SupabaseStudyRepository(supabase), claude)
+health_service = HealthService(SupabaseHealthRepository(supabase))
 
 conversation_history: dict[str, deque] = {}
 # Email drafts awaiting the user's yes/no confirmation before send_email sends.
@@ -171,7 +174,14 @@ BASE_SYSTEM_PROMPT = (
     "returned plan text verbatim — do not rewrite it. Use get_study_plan to show "
     "the plan, update_study_task for 'mark X as coded/done', log_study_result when "
     "a message starts with 'log:' or reports a study result, and study_reflection "
-    "for 'review my week' / 'what did I learn'."
+    "for 'review my week' / 'what did I learn'. "
+    "For training and health, call get_health to pull the user's recent Apple "
+    "Watch metrics and a readiness read (HRV, resting HR, respiratory rate, "
+    "sleep, training load, VO2max). Use it when they ask how they're doing, "
+    "whether to train hard today, or to plan a running/training session — base "
+    "the plan on the readiness signal and recent load, and offer to schedule "
+    "sessions via create_event or save_reminder. Give general guidance only; "
+    "never diagnose, and suggest a doctor for anything concerning."
 )
 
 
@@ -389,6 +399,16 @@ TOOLS = [
         "description": "Returns today's Seoul forecast (current temp, high/low, rain "
                        "probability, UV) plus any contextual tips like bringing an umbrella. "
                        "Use when the user asks about the weather.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_health",
+        "description": "Returns the user's recent Apple Health / Apple Watch metrics with "
+                       "a readiness read: HRV, resting heart rate, respiratory rate and sleep "
+                       "vs. their baseline, recent training load (steps, active energy, "
+                       "exercise minutes, run distance), and VO2max/weight. Use when the user "
+                       "asks how they're doing, whether to train hard, or to plan a training "
+                       "session.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
@@ -818,6 +838,9 @@ def run_tool(name: str, tool_input: dict, user_id: str) -> str:
 
     if name == "get_weather":
         return weather.weather_block()
+
+    if name == "get_health":
+        return health_service.status_summary(user_id)
 
     if name == "create_study_plan":
         try:
