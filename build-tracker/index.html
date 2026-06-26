@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Build Tracker</title>
+  <meta name="description" content="At-a-glance progress across all my projects." />
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📊</text></svg>" />
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap header-inner">
+      <a href="#/" class="brand">
+        <span class="brand-name" id="brand-name">Build Tracker</span>
+        <span class="brand-sub">Build Tracker</span>
+      </a>
+      <nav class="header-actions">
+        <button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+          <span class="theme-icon">☾</span>
+        </button>
+        <a id="github-link" class="icon-btn" href="#" target="_blank" rel="noopener" aria-label="GitHub profile" title="GitHub">↗</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="app" class="wrap">
+    <div class="loading" id="loading">
+      <div class="spinner"></div>
+      <p>Loading your projects…</p>
+    </div>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <span>Sourced live from GitHub · updates when you edit each repo's <code>progress.md</code></span>
+    </div>
+  </footer>
+
+  <script src="config.js"></script>
+  <script src="parser.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

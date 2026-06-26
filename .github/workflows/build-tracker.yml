@@ -1,0 +1,55 @@
+name: Build Tracker data
+
+# Re-bakes build-tracker/data.json from your repos' progress.md files.
+# The token lives only here (Actions secret) — never in the deployed page,
+# so private repos work and stay private.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "progress.md"
+      - "build-tracker/config.js"
+      - "build-tracker/build/**"
+      - ".github/workflows/build-tracker.yml"
+  schedule:
+    - cron: "0 */6 * * *" # every 6 hours: picks up progress.md edits in other repos
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # to commit data.json back
+
+jobs:
+  bake:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Bake data.json
+        env:
+          # Fine-grained PAT with read-only Contents + Metadata on every repo in
+          # config.js. Add it under Settings → Secrets → Actions as TRACKER_TOKEN.
+          TRACKER_TOKEN: ${{ secrets.TRACKER_TOKEN }}
+        run: |
+          if [ -z "$TRACKER_TOKEN" ]; then
+            echo "::notice::TRACKER_TOKEN secret not set — add it to enable baking. Skipping."
+            exit 0
+          fi
+          node build/fetch.cjs
+        working-directory: build-tracker
+
+      - name: Commit data.json if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet -- build-tracker/data.json; then
+            git add build-tracker/data.json
+            git commit -m "chore: refresh build-tracker data [skip ci]"
+            git push
+          else
+            echo "No changes to data.json."
+          fi
