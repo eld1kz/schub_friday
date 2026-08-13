@@ -40,6 +40,8 @@ from location_service import LocationService
 from nudge_service import NudgeService
 from places_provider import CachedPlacesProvider, GooglePlacesProvider
 from retention_cleanup import cleanup_location_retention
+from opportunity_repository import SupabaseOpportunityRepository
+from opportunity_service import OpportunityService
 from study_planner_service import StudyPlannerService
 from study_repository import SupabaseStudyRepository
 from health_repository import SupabaseHealthRepository
@@ -69,6 +71,7 @@ habit_location = LocationService(
     habit_policies,
 )
 study_planner = StudyPlannerService(SupabaseStudyRepository(supabase), claude)
+opportunity_scout = OpportunityService(SupabaseOpportunityRepository(supabase), claude)
 health_service = HealthService(SupabaseHealthRepository(supabase))
 readiness_service = ReadinessService(health_service.repo)
 
@@ -184,7 +187,12 @@ BASE_SYSTEM_PROMPT = (
     "whether to train hard today, or to plan a running/training session — base "
     "the plan on the readiness signal and recent load, and offer to schedule "
     "sessions via create_event or save_reminder. Give general guidance only; "
-    "never diagnose, and suggest a doctor for anything concerning."
+    "never diagnose, and suggest a doctor for anything concerning. "
+    "You are also an opportunity scout. When the user asks to find hackathons, "
+    "internships, competitions, or programs, call find_opportunities (pass their "
+    "specific ask as focus, if any) and relay the report verbatim. Use "
+    "list_opportunities to show recently found ones. When they want to apply to "
+    "one, offer to save_reminder for its deadline or create_event for the event."
 )
 
 
@@ -277,6 +285,28 @@ TOOLS = [
             },
             "required": ["to", "subject", "body"],
         },
+    },
+    {
+        "name": "find_opportunities",
+        "description": "Searches the web for current hackathons, internships, and programs "
+                       "(accelerators, fellowships, grants) matching the user's profile, "
+                       "dedupes against ones already shown, and returns a report of new finds. "
+                       "Slow (~30-60s). Use for 'find me hackathons / opportunities / internships'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "focus": {
+                    "type": "string",
+                    "description": "Optional narrower ask, e.g. 'AI hackathons in Seoul this fall'",
+                }
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "list_opportunities",
+        "description": "Lists the most recently found/saved opportunities without searching again.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "create_automation",
@@ -718,6 +748,12 @@ def run_tool(name: str, tool_input: dict, user_id: str) -> str:
     if name == "read_email":
         return read_email(user_id, tool_input["id"])
 
+    if name == "find_opportunities":
+        return opportunity_scout.scan(user_id, tool_input.get("focus"))
+
+    if name == "list_opportunities":
+        return opportunity_scout.list_saved(user_id)
+
     if name == "send_message":            # used by automations to notify the user
         return tool_input.get("text", "")
 
@@ -977,6 +1013,8 @@ TOOL_STATUS = {
     "read_email": "✉️ Reading the email...",
     "send_email": "📤 Preparing the draft...",
     "get_weather": "🌤 Checking the weather...",
+    "find_opportunities": "🔎 Scouting opportunities (takes a minute)...",
+    "list_opportunities": "📌 Fetching saved opportunities...",
     "create_study_plan": "📚 Building your study plan...",
     "get_study_plan": "📚 Fetching your plan...",
     "update_study_task": "✅ Updating the task...",
@@ -2460,6 +2498,33 @@ DIGEST_SCRIPT = Path(__file__).with_name("daily_digest.py")
 REMINDER_SCRIPT = Path(__file__).with_name("reminder_check.py")
 ENABLE_SCHEDULER = os.environ.get("ENABLE_SCHEDULER", "1") != "0"
 
+OPP_STATE = Path(__file__).with_name("opportunity_state.json")
+OPP_EVERY = 3 * 86400              # scan for opportunities every ~3 days
+
+
+def _opp_scan_due() -> bool:
+    try:
+        if OPP_STATE.exists():
+            last = _parse_ts(json.loads(OPP_STATE.read_text())["last_scan"])
+            return (datetime.now(timezone.utc) - last).total_seconds() >= OPP_EVERY
+    except Exception:
+        pass
+    return True
+
+
+def _run_opportunity_scan() -> None:
+    """Scheduled scan: push new finds to the user's Telegram. Blocking."""
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not chat_id:
+        return
+    OPP_STATE.write_text(json.dumps({"last_scan": datetime.now(timezone.utc).isoformat()}))
+    report = opportunity_scout.scan(chat_id)
+    if report.startswith(("No new opportunities", "Opportunity search failed",
+                          "The search came back empty")):
+        print(f"[opp] scheduled scan: {report[:120]}")
+        return
+    _send_telegram(chat_id, report)
+
 
 async def _run_script(*args: str) -> None:
     try:
@@ -2491,6 +2556,8 @@ async def _scheduler() -> None:
                 if _suggest_due():                                # propose automations ~every 3 days
                     _mark_suggest_run()
                     await asyncio.to_thread(run_suggestion_cycle)
+                if _opp_scan_due():                               # scout opportunities ~every 3 days
+                    await asyncio.to_thread(_run_opportunity_scan)
             done = fired.setdefault(now.date().isoformat(), set())
             if now.hour == 9 and "m" not in done:         # morning digest, 09:00 KST
                 done.add("m")

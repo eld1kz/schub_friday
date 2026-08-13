@@ -17,26 +17,10 @@ credentials*.json
 *.pickle
 
 client_secret*.json
-uni_auth_state.json
-uni_grades_snapshot.json
-uni_grades_report.txt
-uni_overview_snapshot.json
-uni_overview_report.txt
-uni_overview_short.txt
-uni_lms_home.png
-uni_overview_stuck_login.png
-uni_overview_no_courses.png
-uni_api_grades.json
-uni_api_grades_report.txt
-uni_daily_state.json
-uni_daily.log
-uni_daily.out.log
-uni_daily.err.log
-uni_headless_login.png
 digest.morning.log
 digest.evening.log
 reminders.log
-automations_uni_state.json
 automations_email_state.json
 suggestion_state.json
+opportunity_state.json
 .gstack/
