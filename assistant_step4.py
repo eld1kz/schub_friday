@@ -42,6 +42,8 @@ from places_provider import CachedPlacesProvider, GooglePlacesProvider
 from retention_cleanup import cleanup_location_retention
 from opportunity_repository import SupabaseOpportunityRepository
 from opportunity_service import OpportunityService
+from planner_repository import SupabasePlannerRepository
+from planner_service import PlannerService
 from study_planner_service import StudyPlannerService
 from study_repository import SupabaseStudyRepository
 from health_repository import SupabaseHealthRepository
@@ -72,6 +74,25 @@ habit_location = LocationService(
 )
 study_planner = StudyPlannerService(SupabaseStudyRepository(supabase), claude)
 opportunity_scout = OpportunityService(SupabaseOpportunityRepository(supabase), claude)
+day_planner = PlannerService(SupabasePlannerRepository(supabase), claude)
+
+
+def planner_inputs(user_id: str) -> tuple[str, str, str]:
+    """Gather (calendar, reminders, tasks) context strings for the day planner."""
+    try:
+        calendar = list_upcoming_events(user_id, 10)
+    except Exception as e:
+        calendar = f"(calendar error: {e})"
+    try:
+        rows = supabase.table("reminders").select("*").eq("user_id", user_id).execute().data or []
+        reminders = "\n".join(f"- {r.get('text')} @ {r.get('remind_at')}" for r in rows)
+    except Exception:
+        reminders = ""
+    try:
+        tasks = study_planner.show_current_plan(user_id)
+    except Exception as e:
+        tasks = f"(study plan error: {e})"
+    return calendar, reminders, tasks
 health_service = HealthService(SupabaseHealthRepository(supabase))
 readiness_service = ReadinessService(health_service.repo)
 
@@ -192,7 +213,11 @@ BASE_SYSTEM_PROMPT = (
     "internships, competitions, or programs, call find_opportunities (pass their "
     "specific ask as focus, if any) and relay the report verbatim. Use "
     "list_opportunities to show recently found ones. When they want to apply to "
-    "one, offer to save_reminder for its deadline or create_event for the event."
+    "one, offer to save_reminder for its deadline or create_event for the event. "
+    "You are also a day planner. For 'plan my day' / 'what should I do today', "
+    "call plan_my_day and relay the plan verbatim; use get_day_plan to show the "
+    "existing plan. A plan is also sent automatically each morning, and each "
+    "evening the day is reviewed with unfinished items rolled to tomorrow."
 )
 
 
@@ -285,6 +310,18 @@ TOOLS = [
             },
             "required": ["to", "subject", "body"],
         },
+    },
+    {
+        "name": "plan_my_day",
+        "description": "Builds (or rebuilds) a realistic time-blocked plan for TODAY from the "
+                       "user's calendar, reminders, study/project tasks, and yesterday's "
+                       "unfinished items. Use for 'plan my day' / 'what should I do today'.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_day_plan",
+        "description": "Shows today's already-made day plan without rebuilding it.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "find_opportunities",
@@ -748,6 +785,12 @@ def run_tool(name: str, tool_input: dict, user_id: str) -> str:
     if name == "read_email":
         return read_email(user_id, tool_input["id"])
 
+    if name == "plan_my_day":
+        return day_planner.plan_today(user_id, *planner_inputs(user_id))
+
+    if name == "get_day_plan":
+        return day_planner.get_today(user_id)
+
     if name == "find_opportunities":
         return opportunity_scout.scan(user_id, tool_input.get("focus"))
 
@@ -1013,6 +1056,8 @@ TOOL_STATUS = {
     "read_email": "✉️ Reading the email...",
     "send_email": "📤 Preparing the draft...",
     "get_weather": "🌤 Checking the weather...",
+    "plan_my_day": "🗓 Building today's plan...",
+    "get_day_plan": "🗓 Fetching today's plan...",
     "find_opportunities": "🔎 Scouting opportunities (takes a minute)...",
     "list_opportunities": "📌 Fetching saved opportunities...",
     "create_study_plan": "📚 Building your study plan...",

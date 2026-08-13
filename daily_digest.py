@@ -1,6 +1,7 @@
 """
 Daily life briefing (выжимка). Gathers calendar, email, and reminders, then asks
-Claude to write a short summary and sends it to Telegram.
+Claude to write a short summary and sends it to Telegram. Morning also appends
+today's time-blocked day plan; evening appends the plan review + rollover.
 
     python daily_digest.py            # MORNING: what's important / coming up
     python daily_digest.py --evening  # EVENING: what you achieved today
@@ -119,6 +120,19 @@ def main() -> None:
         # warning is right there before leaving. Plain code, no extra LLM call.
         if not args.evening:
             text = f"{weather.weather_block()}\n\n{text}"
+
+        # Planning layer: morning gets today's time-blocked plan, evening gets
+        # the review (done / rolls to tomorrow) that seeds tomorrow's plan.
+        if CHAT_ID:
+            try:
+                if args.evening:
+                    _, reminders, tasks = bot.planner_inputs(CHAT_ID)
+                    plan_part = bot.day_planner.review_today(CHAT_ID, reminders, tasks)
+                else:
+                    plan_part = bot.day_planner.plan_today(CHAT_ID, *bot.planner_inputs(CHAT_ID))
+                text = f"{text}\n\n🗓 {'Day review' if args.evening else 'Today’s plan'}:\n{plan_part}"
+            except Exception as e:
+                print(f"[digest] planner failed: {e}")
 
         print(text)
         send_telegram(text)
