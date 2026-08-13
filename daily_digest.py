@@ -126,7 +126,7 @@ def main() -> None:
         if CHAT_ID:
             try:
                 if args.evening:
-                    _, reminders, tasks = bot.planner_inputs(CHAT_ID)
+                    _, reminders, tasks, _ = bot.planner_inputs(CHAT_ID)
                     plan_part = bot.day_planner.review_today(CHAT_ID, reminders, tasks)
                 else:
                     plan_part = bot.day_planner.plan_today(CHAT_ID, *bot.planner_inputs(CHAT_ID))

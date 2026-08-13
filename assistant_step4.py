@@ -80,12 +80,16 @@ day_planner = PlannerService(SupabasePlannerRepository(supabase), claude)
 life = LifeService(SupabaseLifeRepository(supabase))
 
 
-def planner_inputs(user_id: str) -> tuple[str, str, str]:
-    """Gather (calendar, reminders, tasks) context strings for the day planner."""
+def planner_inputs(user_id: str) -> tuple[str, str, str, str]:
+    """Gather (calendar, reminders, tasks, readiness) context for the day planner."""
     try:
         calendar = list_upcoming_events(user_id, 10)
     except Exception as e:
         calendar = f"(calendar error: {e})"
+    try:
+        readiness = readiness_service.check(user_id).get("summary", "")
+    except Exception:
+        readiness = ""
     try:
         rows = supabase.table("reminders").select("*").eq("user_id", user_id).execute().data or []
         reminders = "\n".join(f"- {r.get('text')} @ {r.get('remind_at')}" for r in rows)
@@ -104,7 +108,7 @@ def planner_inputs(user_id: str) -> tuple[str, str, str]:
             tasks += f"\n\nINBOX (captured ideas/tasks to consider):\n{inbox}"
     except Exception as e:
         print(f"[plan] life context failed: {e}")
-    return calendar, reminders, tasks
+    return calendar, reminders, tasks, readiness
 health_service = HealthService(SupabaseHealthRepository(supabase))
 readiness_service = ReadinessService(health_service.repo)
 

@@ -82,3 +82,14 @@ def test_plan_context_handles_empty_sections():
     ctx = _plan_context(TODAY, "", "", "", None)
     assert "none" in ctx and "ROLLOVER" not in ctx
     assert "Thursday, 2026-08-13" in ctx
+    assert "READINESS" not in ctx
+
+
+def test_plan_today_includes_readiness_signal():
+    repo, claude = FakeRepo(), FakeClaude()
+    PlannerService(repo, claude).plan_today(
+        "u1", "", "", "", readiness="Recover — rest or very easy day: short sleep (5.2h).",
+        today=TODAY,
+    )
+    assert "READINESS SIGNAL" in claude.last_context
+    assert "Recover" in claude.last_context

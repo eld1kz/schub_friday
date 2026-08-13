@@ -18,7 +18,10 @@ PLAN_SYSTEM = (
     "plan around them; fit focused project/study blocks (60-90 min) into the "
     "gaps, picking the most important unfinished tasks; include due reminders "
     "at sensible times; leave real breaks and don't overpack — a plan that "
-    "fits is better than one that impresses. If yesterday's rollover lists "
+    "fits is better than one that impresses. If a readiness signal is given: "
+    "on a REST/low-recovery day, lighten the plan — fewer/shorter deep-focus "
+    "blocks, more breaks, push non-urgent hard tasks; on a READY day, it's "
+    "fine to schedule a demanding focus block. If yesterday's rollover lists "
     "unfinished items, schedule them first. Format: short lines like "
     "'09:00-10:30 ...' with a few emojis, then one 'Top priority:' line. "
     "Plain text only — no Markdown (no ** or #), it renders literally in "
@@ -42,12 +45,12 @@ class PlannerService:
         self.repo = repo
         self.claude = claude_client
 
-    def plan_today(self, user_id: str, calendar: str, reminders: str,
-                   tasks: str, today: date | None = None) -> str:
+    def plan_today(self, user_id: str, calendar: str, reminders: str, tasks: str,
+                   readiness: str = "", today: date | None = None) -> str:
         """Generate (or regenerate) today's plan and store it."""
         today = today or date.today()
         rollover = self._rollover_from_yesterday(user_id, today)
-        context = _plan_context(today, calendar, reminders, tasks, rollover)
+        context = _plan_context(today, calendar, reminders, tasks, rollover, readiness)
         try:
             plan = self._ask(PLAN_SYSTEM, context)
         except Exception as e:
@@ -105,9 +108,11 @@ class PlannerService:
         return "".join(b.text for b in resp.content if hasattr(b, "text")).strip()
 
 
-def _plan_context(today: date, calendar: str, reminders: str,
-                  tasks: str, rollover: str | None) -> str:
+def _plan_context(today: date, calendar: str, reminders: str, tasks: str,
+                  rollover: str | None, readiness: str = "") -> str:
     lines = [f"Planning for {today.strftime('%A, %Y-%m-%d')} (KST).", ""]
+    if readiness:
+        lines += ["READINESS SIGNAL:", readiness, ""]
     if rollover:
         lines += ["YESTERDAY'S REVIEW / ROLLOVER:", rollover, ""]
     lines += ["FIXED CALENDAR EVENTS:", (calendar or "").strip() or "none", ""]
