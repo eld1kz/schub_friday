@@ -40,6 +40,8 @@ from location_service import LocationService
 from nudge_service import NudgeService
 from places_provider import CachedPlacesProvider, GooglePlacesProvider
 from retention_cleanup import cleanup_location_retention
+from life_repository import SupabaseLifeRepository
+from life_service import LifeService
 from opportunity_repository import SupabaseOpportunityRepository
 from opportunity_service import OpportunityService
 from planner_repository import SupabasePlannerRepository
@@ -75,6 +77,7 @@ habit_location = LocationService(
 study_planner = StudyPlannerService(SupabaseStudyRepository(supabase), claude)
 opportunity_scout = OpportunityService(SupabaseOpportunityRepository(supabase), claude)
 day_planner = PlannerService(SupabasePlannerRepository(supabase), claude)
+life = LifeService(SupabaseLifeRepository(supabase))
 
 
 def planner_inputs(user_id: str) -> tuple[str, str, str]:
@@ -92,6 +95,15 @@ def planner_inputs(user_id: str) -> tuple[str, str, str]:
         tasks = study_planner.show_current_plan(user_id)
     except Exception as e:
         tasks = f"(study plan error: {e})"
+    try:
+        deadlines = life.deadline_context(user_id)
+        if deadlines:
+            tasks += f"\n\nOPEN DEADLINES:\n{deadlines}"
+        inbox = life.inbox_context(user_id)
+        if inbox:
+            tasks += f"\n\nINBOX (captured ideas/tasks to consider):\n{inbox}"
+    except Exception as e:
+        print(f"[plan] life context failed: {e}")
     return calendar, reminders, tasks
 health_service = HealthService(SupabaseHealthRepository(supabase))
 readiness_service = ReadinessService(health_service.repo)
@@ -217,7 +229,13 @@ BASE_SYSTEM_PROMPT = (
     "You are also a day planner. For 'plan my day' / 'what should I do today', "
     "call plan_my_day and relay the plan verbatim; use get_day_plan to show the "
     "existing plan. A plan is also sent automatically each morning, and each "
-    "evening the day is reviewed with unfinished items rolled to tomorrow."
+    "evening the day is reviewed with unfinished items rolled to tomorrow. "
+    "You also keep a quick-capture inbox and a deadline tracker. When the user "
+    "shares a stray idea/task/note ('idea: ...', 'remember to check X'), call "
+    "capture_item. When they mention anything due by a date (assignment, "
+    "application, registration), call add_deadline — they'll get escalating "
+    "warnings at 7/3/1 days. Use list_inbox / list_deadlines to show them and "
+    "complete_inbox_item / complete_deadline (by number) to clear items."
 )
 
 
@@ -309,6 +327,62 @@ TOOLS = [
                 "body": {"type": "string", "description": "Email body text"},
             },
             "required": ["to", "subject", "body"],
+        },
+    },
+    {
+        "name": "capture_item",
+        "description": "Saves a stray idea, task, or note to the user's inbox so it isn't lost "
+                       "and gets considered in day planning. Use when the user says 'idea: ...', "
+                       "'note: ...', 'remember to look into X', or forwards a thought to keep.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "The idea/task/note text"},
+                "kind": {"type": "string", "enum": ["idea", "task", "note"]},
+            },
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "list_inbox",
+        "description": "Shows the user's open inbox items (captured ideas/tasks/notes).",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "complete_inbox_item",
+        "description": "Marks inbox item number N as done (numbers as shown by list_inbox).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"number": {"type": "integer"}},
+            "required": ["number"],
+        },
+    },
+    {
+        "name": "add_deadline",
+        "description": "Tracks a deadline (assignment, application, registration). The bot warns "
+                       "the user 7, 3, and 1 days before and on the due day. Use when the user "
+                       "mentions anything due by a date that isn't a calendar event.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "What is due"},
+                "due_date": {"type": "string", "description": "YYYY-MM-DD"},
+            },
+            "required": ["title", "due_date"],
+        },
+    },
+    {
+        "name": "list_deadlines",
+        "description": "Lists the user's open deadlines with days remaining.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "complete_deadline",
+        "description": "Marks deadline number N as done (numbers as shown by list_deadlines).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"number": {"type": "integer"}},
+            "required": ["number"],
         },
     },
     {
@@ -785,6 +859,24 @@ def run_tool(name: str, tool_input: dict, user_id: str) -> str:
     if name == "read_email":
         return read_email(user_id, tool_input["id"])
 
+    if name == "capture_item":
+        return life.capture(user_id, tool_input["text"], tool_input.get("kind", "note"))
+
+    if name == "list_inbox":
+        return life.show_inbox(user_id)
+
+    if name == "complete_inbox_item":
+        return life.complete_inbox(user_id, int(tool_input["number"]))
+
+    if name == "add_deadline":
+        return life.add_deadline(user_id, tool_input["title"], tool_input["due_date"])
+
+    if name == "list_deadlines":
+        return life.show_deadlines(user_id)
+
+    if name == "complete_deadline":
+        return life.complete_deadline(user_id, int(tool_input["number"]))
+
     if name == "plan_my_day":
         return day_planner.plan_today(user_id, *planner_inputs(user_id))
 
@@ -1056,6 +1148,12 @@ TOOL_STATUS = {
     "read_email": "✉️ Reading the email...",
     "send_email": "📤 Preparing the draft...",
     "get_weather": "🌤 Checking the weather...",
+    "capture_item": "📥 Capturing...",
+    "list_inbox": "📥 Fetching your inbox...",
+    "complete_inbox_item": "✅ Clearing the item...",
+    "add_deadline": "⏳ Tracking the deadline...",
+    "list_deadlines": "⏳ Fetching deadlines...",
+    "complete_deadline": "✅ Closing the deadline...",
     "plan_my_day": "🗓 Building today's plan...",
     "get_day_plan": "🗓 Fetching today's plan...",
     "find_opportunities": "🔎 Scouting opportunities (takes a minute)...",
@@ -1621,6 +1719,89 @@ def _maybe_start_habit_request(user_id: str, text: str) -> bool:
         _send_telegram(user_id, "Got it. I'll remind you when you are near a grocery store.")
         return True
     return False
+
+
+PHOTO_EXTRACT_SYSTEM = (
+    "You are looking at a photo the user sent to their personal assistant "
+    "(often a poster, screenshot, assignment brief, schedule, or receipt). "
+    "Describe concisely what it shows and extract anything actionable: event "
+    "names, dates, deadlines, times, places, URLs, amounts, tasks. Plain text, "
+    "under ~120 words. If nothing actionable, just describe it briefly."
+)
+
+
+def _extract_photo(image_b64: str, mime: str) -> str:
+    resp = claude.messages.create(
+        model="claude-sonnet-4-6", max_tokens=500,
+        system=PHOTO_EXTRACT_SYSTEM,
+        messages=[{
+            "role": "user",
+            "content": [{
+                "type": "image",
+                "source": {"type": "base64", "media_type": mime, "data": image_b64},
+            }],
+        }],
+    )
+    return "".join(b.text for b in resp.content if hasattr(b, "text")).strip()
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Photo input: vision-extract the content, then run it through the normal
+    assistant flow so tools (deadlines, capture, calendar) can act on it."""
+    user_id = str(update.effective_user.id)
+    if not _is_authorized(user_id):
+        await update.message.reply_text("Sorry, this is a private bot.")
+        return
+    status = StatusReporter(context, update.effective_chat.id)
+    await status.start()
+    try:
+        await status.update("👀 Reading the photo...")
+        photo = update.message.photo[-1]          # largest size
+        tg_file = await photo.get_file()
+        data = bytes(await tg_file.download_as_bytearray())
+        image_b64 = base64.standard_b64encode(data).decode()
+        extracted = await asyncio.to_thread(_extract_photo, image_b64, "image/jpeg")
+
+        caption = (update.message.caption or "").strip()
+        user_text = (
+            f"[I sent a photo{'; caption: ' + caption if caption else ''}. "
+            f"Its content: {extracted}] "
+            "Act on this if something is actionable (deadline, event, task to "
+            "capture) — otherwise just tell me what you see."
+        )
+
+        if user_id not in conversation_history:
+            conversation_history[user_id] = deque(maxlen=10)
+        long_term = await asyncio.to_thread(fetch_memories, user_id)
+        system = BASE_SYSTEM_PROMPT + long_term
+
+        def on_tool(tool_name: str) -> None:
+            text = TOOL_STATUS.get(tool_name)
+            if text:
+                status.update_threadsafe(text)
+
+        conversation_history[user_id].append({"role": "user", "content": user_text})
+        reply = await asyncio.to_thread(
+            call_claude, list(conversation_history[user_id]),
+            system, user_id, "claude-sonnet-4-6", on_tool,
+        )
+        conversation_history[user_id].append({"role": "assistant", "content": reply})
+    except Exception as e:
+        await status.finish()
+        print(f"[photo] error: {type(e).__name__}: {e}")
+        await update.message.reply_text("Sorry — couldn't process that photo. Please try again.")
+        return
+    await status.finish()
+    await update.message.reply_text(reply)
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = str(update.effective_user.id)
+    if not _is_authorized(user_id):
+        return
+    await update.message.reply_text(
+        "🎙 I can't listen to voice notes yet — type it out for now and I'll handle it."
+    )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2557,6 +2738,19 @@ def _opp_scan_due() -> bool:
     return True
 
 
+def _send_deadline_warnings() -> None:
+    """Push escalating deadline warnings (7/3/1/0 days). Dedupe is handled by
+    last_warned_days in the table, so calling often is safe. Blocking."""
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not chat_id:
+        return
+    try:
+        for w in life.pending_warnings(chat_id):
+            _send_telegram(chat_id, w)
+    except Exception as e:
+        print(f"[deadline] warning check failed: {e}")
+
+
 def _run_opportunity_scan() -> None:
     """Scheduled scan: push new finds to the user's Telegram. Blocking."""
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -2603,6 +2797,7 @@ async def _scheduler() -> None:
                     await asyncio.to_thread(run_suggestion_cycle)
                 if _opp_scan_due():                               # scout opportunities ~every 3 days
                     await asyncio.to_thread(_run_opportunity_scan)
+                await asyncio.to_thread(_send_deadline_warnings)  # 7/3/1/0-day warnings
             done = fired.setdefault(now.date().isoformat(), set())
             if now.hour == 9 and "m" not in done:         # morning digest, 09:00 KST
                 done.add("m")
@@ -2671,6 +2866,8 @@ def main() -> None:
     app.add_handler(CommandHandler("forget_locations", handle_forget_locations))
     app.add_handler(CommandHandler("forget_habits", handle_forget_habits))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.LOCATION, handle_location_update))
     app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.LOCATION, handle_location_update))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
