@@ -39,3 +39,4 @@ reminders.log
 automations_uni_state.json
 automations_email_state.json
 suggestion_state.json
+.gstack/

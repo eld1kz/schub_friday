@@ -157,14 +157,14 @@ BASE_SYSTEM_PROMPT = (
     "You are a concise, friendly personal assistant. "
     "Keep replies short and direct. No unnecessary filler. "
     "You have tools to check the time, save reminders, search the web, "
-    "manage the user's Google Calendar, read and send Gmail, check the "
-    "user's university grades and assignments, and check today's weather. "
+    "manage the user's Google Calendar, read and send Gmail, and check "
+    "today's weather. "
     "When the user asks to send an email, call send_email to prepare a draft. "
     "It does NOT send immediately — show the user the drafted email and tell "
     "them to reply 'yes' to send or 'no' to cancel. "
     "You can also create and manage automations ('recipes') for the user. When "
     "they say 'create an automation: ...' (or describe a rule like 'every morning "
-    "tell me X', 'when I get a grade do Y'), call create_automation with their "
+    "tell me X', 'when I get an email do Y'), call create_automation with their "
     "rule text verbatim and relay the confirmation. Use list_automations, "
     "set_automation, and delete_automation to manage them. You also proactively "
     "suggest automations; if the user asks to stop or resume those suggestions, "
@@ -279,24 +279,10 @@ TOOLS = [
         },
     },
     {
-        "name": "check_grades",
-        "description": "Checks the user's Korea University (LMS) grades and assignments "
-                       "via the Canvas API: per-course current/final score plus each "
-                       "assignment's score, submission status, and due date.",
-        "input_schema": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "check_assignments",
-        "description": "Lists the user's university assignments via the Canvas API: which are "
-                       "not submitted (with due dates, flagging overdue) and which are "
-                       "submitted awaiting a grade. Use for 'what's due' / 'what do I owe'.",
-        "input_schema": {"type": "object", "properties": {}, "required": []},
-    },
-    {
         "name": "create_automation",
         "description": "Creates a user-defined automation ('recipe') from a plain-language rule, "
-                       "e.g. 'every morning at 8 tell me what's due', 'when I get a grade below 80 "
-                       "remind me to study', or 'when I text gym log a reminder'. Pass the user's "
+                       "e.g. 'every morning at 8 tell me my calendar', 'when I get an email from X "
+                       "notify me', or 'when I text gym log a reminder'. Pass the user's "
                        "rule text verbatim; it is parsed into a trigger + action and saved.",
         "input_schema": {
             "type": "object",
@@ -700,39 +686,6 @@ def _classify_confirmation(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# University grades (Canvas API, run as a subprocess)
-# ---------------------------------------------------------------------------
-
-GRADES_SCRIPT = Path(__file__).with_name("uni_api_grades.py")
-
-
-def _run_uni_script(*args: str) -> str:
-    """Run the Canvas API reader in a subprocess and return its stdout report."""
-    try:
-        proc = subprocess.run(
-            [sys.executable, str(GRADES_SCRIPT), *args],
-            capture_output=True, text=True, timeout=180,
-        )
-    except subprocess.TimeoutExpired:
-        return "University check timed out. Try again in a moment."
-    if proc.returncode != 0:
-        msg = (proc.stderr or proc.stdout).strip()
-        if "uni_login_test" in msg or "Session expired" in msg or "401" in msg:
-            return ("University session expired. On the computer running the bot, run "
-                    "`python uni_login_test.py` to log in again, then ask me to re-check.")
-        return f"Could not read university data: {msg[:300]}"
-    return proc.stdout.strip() or "No data found."
-
-
-def check_university_grades() -> str:
-    return _run_uni_script()
-
-
-def check_university_assignments() -> str:
-    return _run_uni_script("--assignments")
-
-
-# ---------------------------------------------------------------------------
 # Tool execution
 # ---------------------------------------------------------------------------
 
@@ -764,12 +717,6 @@ def run_tool(name: str, tool_input: dict, user_id: str) -> str:
 
     if name == "read_email":
         return read_email(user_id, tool_input["id"])
-
-    if name == "check_grades":
-        return check_university_grades()
-
-    if name == "check_assignments":
-        return check_university_assignments()
 
     if name == "send_message":            # used by automations to notify the user
         return tool_input.get("text", "")
@@ -1029,8 +976,6 @@ TOOL_STATUS = {
     "list_recent_emails": "✉️ Checking your inbox...",
     "read_email": "✉️ Reading the email...",
     "send_email": "📤 Preparing the draft...",
-    "check_grades": "🎓 Checking your grades...",
-    "check_assignments": "📝 Checking your assignments...",
     "get_weather": "🌤 Checking the weather...",
     "create_study_plan": "📚 Building your study plan...",
     "get_study_plan": "📚 Fetching your plan...",
@@ -1713,9 +1658,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 #
 #   • schedule  — checked every ~60s on the existing _scheduler loop via croniter
 #                 (cron is interpreted in KST). last_run gates re-firing.
-#   • event     — polled every ~15 min: new grades/assignments are diffed against
-#                 a SEPARATE baseline file (so it never consumes the digest's
-#                 uni_daily_state.json), new emails against a seen-id baseline.
+#   • event     — polled every ~15 min: new emails are diffed against a seen-id
+#                 baseline file, separate from the digest's own state.
 #   • keyword   — checked in handle_message before the normal LLM flow.
 #
 #   The optional condition is evaluated by a cheap Haiku yes/no against the
@@ -1730,8 +1674,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # Tools an automation's action may invoke (send_message is automation-only).
 ACTION_TOOLS = {
     "send_message", "save_reminder", "list_upcoming_events", "create_event",
-    "list_recent_emails", "read_email", "check_grades", "check_assignments",
-    "send_email",
+    "list_recent_emails", "read_email", "send_email",
 }
 
 # "Action-tier" tools have outward/booking side-effects: they must always be
@@ -1742,7 +1685,6 @@ ACTION_TIER_TOOLS = {"send_email", "create_event"}
 def _tier(action: dict) -> str:
     return "action" if (action or {}).get("tool") in ACTION_TIER_TOOLS else "read_only"
 
-UNI_EVENT_STATE = Path(__file__).with_name("automations_uni_state.json")
 EMAIL_EVENT_STATE = Path(__file__).with_name("automations_email_state.json")
 
 SSL_CTX = ssl.create_default_context(cafile=certifi.where())
@@ -1778,9 +1720,9 @@ Output ONLY a JSON object (no prose, no code fences) with these keys:
   trigger_type   : "schedule" | "event" | "keyword"
   trigger_config : object, depends on trigger_type:
        schedule -> {"cron": "<m h dom mon dow>"}  (5-field cron, interpreted in KST / Asia-Seoul)
-       event    -> {"event": "grade" | "assignment" | "email",
-                    optional "from": "<sender substring>",        (email only)
-                    optional "subject_contains": "<substring>"}   (email only)
+       event    -> {"event": "email",
+                    optional "from": "<sender substring>",
+                    optional "subject_contains": "<substring>"}
        keyword  -> {"phrase": "<lowercase phrase to match in incoming messages>"}
   condition      : a natural-language condition string, or null if none
   action         : {"tool": "<tool name>", "input": { ... }}
@@ -1792,13 +1734,11 @@ Available action tools and their input fields:
   create_event         {"title": "...", "start": "<ISO>", "end": "<ISO>"}
   list_recent_emails   {"count": <int, optional>}
   read_email           {"id": "<gmail id>"}
-  check_grades         {}
-  check_assignments    {}
   send_email           {"to": "...", "subject": "...", "body": "..."}   (the user will confirm before it sends)
 
 Rules:
 - Map natural times to cron: "every morning at 8" -> "0 8 * * *", "every Monday 9am" -> "0 9 * * 1".
-- Use an event trigger for "when I get a grade / assignment / email".
+- Use an event trigger for "when I get an email".
 - Use a keyword trigger for "when I say / text X".
 - If the rule only notifies the user, use the send_message action.
 - Put any "only if ..." part into condition, NOT into the trigger.
@@ -2083,56 +2023,13 @@ def run_due_schedule_automations() -> None:
 
 
 def poll_event_automations() -> None:
-    """Detect new grades/assignments/emails and fire matching automations. Blocking."""
+    """Detect new emails and fire matching automations. Blocking."""
     autos = _enabled("event")
     if not autos:
         return
-    uni_autos = [a for a in autos if (a.get("trigger_config") or {}).get("event") in ("grade", "assignment")]
     email_autos = [a for a in autos if (a.get("trigger_config") or {}).get("event") == "email"]
-    if uni_autos:
-        _poll_uni_events(uni_autos)
     if email_autos:
         _poll_email_events(email_autos)
-
-
-def _save_uni_baseline(curr) -> None:
-    import uni_daily
-    UNI_EVENT_STATE.write_text(
-        json.dumps(uni_daily.serialize(*curr), ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-
-
-def _load_uni_baseline():
-    if not UNI_EVENT_STATE.exists():
-        return None
-    raw = json.loads(UNI_EVENT_STATE.read_text(encoding="utf-8"))
-    items = {}
-    for k, v in raw.get("items", {}).items():
-        course, name = k.split("|||", 1)
-        items[(course, name)] = v
-    return raw.get("totals", {}), items
-
-
-def _poll_uni_events(autos: list) -> None:
-    try:
-        import uni_daily
-        from uni_api_grades import fetch_grades
-        uni_daily.refresh_session()
-        curr = uni_daily.flatten(fetch_grades())
-    except Exception as e:
-        print(f"[auto] uni event poll failed: {e}")
-        return
-    prev = _load_uni_baseline()
-    _save_uni_baseline(curr)
-    if prev is None:
-        return                            # first run: baseline only, no firing
-    for ch in uni_daily.diff(prev, curr):
-        kind = "assignment" if ch.startswith("🆕") else "grade"
-        for a in autos:
-            if (a.get("trigger_config") or {}).get("event") != kind:
-                continue
-            if execute_automation(a, context_text=ch):
-                _mark_run(a["id"])
 
 
 def _email_meta(user_id: str, count: int = 10):
@@ -2304,13 +2201,13 @@ Output ONLY a JSON array (0 to 2 objects). Each object:
   description    : short restatement of what the automation does
   trigger_type   : "schedule" | "event" | "keyword"
   trigger_config : schedule -> {"cron": "<m h dom mon dow>"} (KST);
-                   event -> {"event": "grade"|"assignment"|"email", optional "from", "subject_contains"};
+                   event -> {"event": "email", optional "from", "subject_contains"};
                    keyword -> {"phrase": "<lowercase phrase>"}
   condition      : natural-language condition or null
   action         : {"tool": "<name>", "input": {...}}
 
 Action tools: send_message {"text"}, save_reminder {"text","remind_at"},
-list_upcoming_events {}, list_recent_emails {}, check_grades {}, check_assignments {},
+list_upcoming_events {}, list_recent_emails {},
 create_event {"title","start","end"}, send_email {"to","subject","body"}.
 
 Strongly prefer read-only actions (send_message / surfacing info / reminders). Only propose
@@ -2561,7 +2458,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 DIGEST_SCRIPT = Path(__file__).with_name("daily_digest.py")
 REMINDER_SCRIPT = Path(__file__).with_name("reminder_check.py")
-REFRESH_SCRIPT = Path(__file__).with_name("uni_refresh_session.py")
 ENABLE_SCHEDULER = os.environ.get("ENABLE_SCHEDULER", "1") != "0"
 
 
@@ -2579,8 +2475,6 @@ async def _run_script(*args: str) -> None:
 
 
 async def _scheduler() -> None:
-    # Bootstrap the LMS session so grades work right after a (re)deploy.
-    await _run_script(str(REFRESH_SCRIPT))
     last_reminder = 0.0
     fired: dict[str, set] = {}
     while True:
@@ -2593,7 +2487,7 @@ async def _scheduler() -> None:
             if t - last_reminder >= 900:                  # reminders every 15 min
                 last_reminder = t
                 await _run_script(str(REMINDER_SCRIPT))
-                await asyncio.to_thread(poll_event_automations)   # new grades/assignments/emails
+                await asyncio.to_thread(poll_event_automations)   # new emails
                 if _suggest_due():                                # propose automations ~every 3 days
                     _mark_suggest_run()
                     await asyncio.to_thread(run_suggestion_cycle)
